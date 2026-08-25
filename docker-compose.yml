@@ -1,0 +1,17 @@
+services:
+  hermes-dashboard:
+    build: .
+    image: hermes-dashboard:local
+    container_name: hermes-dashboard
+    # Host networking is required for three separate reasons: the wake-on-LAN
+    # magic packet is a layer-2 broadcast that a bridge network would swallow,
+    # the target PC's sysfs is reached over the local LAN, and Ollama is reached
+    # over the tailnet, whose routes exist only in the host netns.
+    network_mode: host
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # SSH key used to reach the PC (and, optionally, the Hermes machine).
+      - ./ssh:/ssh:ro
+      # Persists the synced token table across restarts.
+      - ./state:/data

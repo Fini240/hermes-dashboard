@@ -1,0 +1,8 @@
+# Real deployment values — hosts, MACs, and the account the token sync logs in as.
+.env
+# Private key + known_hosts for the monitored machine.
+ssh/
+# Synced token table; regenerates on its own.
+state/
+.docker/
+__pycache__/
