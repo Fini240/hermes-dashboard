@@ -261,10 +261,28 @@ def probe_tokens():
                    COALESCE(SUM(cache_write_tokens),0), COALESCE(SUM(reasoning_tokens),0),
                    COUNT(DISTINCT session_id)
             FROM session_model_usage""").fetchone()
-        cs = cur.execute("""
-            SELECT session_id, model, api_call_count, input_tokens, output_tokens,
-                   cache_read_tokens, first_seen, last_seen
-            FROM session_model_usage ORDER BY last_seen DESC LIMIT 1""").fetchone()
+        # The current session can span several rows (Hermes writes a new
+        # session_model_usage row per segment / model switch), and some rows
+        # carry first_seen == last_seen. Picking one row gave a partial count
+        # and, on a zero-span row, a garbage tok/s. Aggregate the whole session
+        # instead: real totals, and a true span from MIN/MAX of the timestamps.
+        latest = cur.execute("""
+            SELECT session_id FROM session_model_usage
+            ORDER BY last_seen DESC LIMIT 1""").fetchone()
+        cs = None
+        if latest:
+            sid = latest[0]
+            cs = cur.execute("""
+                SELECT session_id,
+                       (SELECT model FROM session_model_usage
+                        WHERE session_id = ? ORDER BY last_seen DESC LIMIT 1),
+                       COALESCE(SUM(api_call_count), 0),
+                       COALESCE(SUM(input_tokens), 0),
+                       COALESCE(SUM(output_tokens), 0),
+                       COALESCE(SUM(cache_read_tokens), 0),
+                       MIN(first_seen), MAX(last_seen)
+                FROM session_model_usage WHERE session_id = ?""",
+                (sid, sid)).fetchone()
         models = cur.execute("""
             SELECT model, SUM(api_call_count), SUM(input_tokens),
                    SUM(output_tokens), SUM(cache_read_tokens)
@@ -702,7 +720,7 @@ async function tick(){
     B.push(stat('Generating now',s.rate?s.rate.toFixed(1):'idle',s.rate?'tok/s':'',
       (s.rate?'averaged over '+Math.round(s.window||25)+'s':'no output in the last '+
         Math.round(s.window||25)+'s')+
-      (c?' · session avg '+(c.out/c.span).toFixed(1)+' tok/s':''),
+      (c&&c.span>=10&&c.out>0?' · session avg '+(c.out/c.span).toFixed(1)+' tok/s':''),
       null,null,spark('rate','#3ddc84')));
     let o='<div class="card"><div class="label">All time · '+t.sessions+' sessions</div>';
     o+='<div class="rowsplit"><span class="k">Input</span><span class="v">'+num(t['in'])+'</span></div>';
