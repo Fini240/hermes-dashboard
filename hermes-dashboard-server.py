@@ -109,6 +109,15 @@ echo "ncpu=$(nproc)"
 echo "load=$(cut -d' ' -f1 /proc/loadavg)"
 echo "uptime=$(cut -d. -f1 /proc/uptime)"
 echo "top=$(ps -eo pcpu,comm --sort=-pcpu --no-headers 2>/dev/null | head -3 | awk '{printf "%s %s|", $1, $2}')"
+# True generation speed straight from Ollama's own llama-server timings, which
+# it logs to the journal of whatever user runs `ollama serve`. This is the real
+# tok/s of the last completed response for ANY client, not just Hermes traffic,
+# and it lands in the journal within a moment of the response finishing.
+_uid=$(ps -o uid= -C ollama 2>/dev/null | awk 'NR==1{print $1}')
+[ -n "$_uid" ] || _uid=0
+_g=$(journalctl _UID=$_uid -o short-unix --no-pager -n 400 2>/dev/null | grep 'eval time =' | grep -v 'prompt eval time' | tail -1)
+echo "gen_rate=$(printf '%s' "$_g" | sed -n 's/.*, *\([0-9.]*\) tokens per second.*/\1/p')"
+echo "gen_ts=$(printf '%s' "$_g" | awk '{print $1}' | cut -d. -f1)"
 """
 
 def _magic(mac):
@@ -424,11 +433,25 @@ def poller():
                 if dt >= 2.0 and d > 0:
                     rate = d / dt
 
+        # True generation rate from Ollama's llama-server timings (via probe_pc).
+        # gen_ts is when the last response finished, so gen_age tells the page how
+        # fresh it is; the poll runs on POLL_SECONDS so this refreshes promptly.
+        gen_rate = gen_age = None
+        if pc:
+            try:
+                gr = float(pc.get("gen_rate") or 0)
+                gts = float(pc.get("gen_ts") or 0)
+                if gr > 0 and gts > 0:
+                    gen_rate, gen_age = gr, max(0.0, t0 - gts)
+            except (TypeError, ValueError):
+                pass
+
         snap = {"ok": True, "ts": t0,
                 "online": pc is not None or oll is not None,
                 # ssh reachable, so GPU/CPU/RAM figures are available.
                 "host_stats": pc is not None,
                 "rate": rate,
+                "gen_rate": gen_rate, "gen_age": gen_age,
                 "home": on_home_lan(), "relay": RELAY_HOST,
                 "window": RATE_WINDOW,
                 # Age of the token numbers. None when this host owns state.db
@@ -704,7 +727,6 @@ async function tick(){
 
   const t=s.tokens;
   if(t){
-    push('rate',s.rate||0);
     const c=t.current;
     // On a synced copy the numbers are only as fresh as the last successful
     // pull from the Mac, so say so rather than letting them read as live.
@@ -717,11 +739,29 @@ async function tick(){
     }
     B.push('<h2>Tokens'+age+'</h2><div class="grid g2">');
     B.push('<div class="stackcol">');
-    B.push(stat('Generating now',s.rate?s.rate.toFixed(1):'idle',s.rate?'tok/s':'',
-      (s.rate?'averaged over '+Math.round(s.window||25)+'s':'no output in the last '+
-        Math.round(s.window||25)+'s')+
-      (c&&c.span>=10&&c.out>0?' · session avg '+(c.out/c.span).toFixed(1)+' tok/s':''),
-      null,null,spark('rate','#3ddc84')));
+    // Prefer the true generation rate straight from Ollama (any client), which
+    // is fresh within a poll of each response finishing. Fall back to the
+    // Hermes-derived window rate, then to idle. The GPU busy % tells us whether
+    // a response is being produced right now vs. just recently.
+    const g=(s.gen_rate!=null&&s.gen_age!=null), busy=!!(s.pc&&s.pc.busy>40);
+    const gFresh=g&&s.gen_age<120;
+    let bignum,unit,sub;
+    if(gFresh){
+      bignum=s.gen_rate.toFixed(1); unit='tok/s';
+      sub=busy?'generating now':'last response '+dur(s.gen_age)+' ago';
+    }else if(busy){
+      bignum='···'; unit='';
+      sub='model busy — waiting for first response';
+    }else if(s.rate){
+      bignum=s.rate.toFixed(1); unit='tok/s';
+      sub='averaged over '+Math.round(s.window||25)+'s';
+    }else{
+      bignum='idle'; unit='';
+      sub=g?'last response '+dur(s.gen_age)+' ago':'no recent generation';
+    }
+    if(c&&c.span>=10&&c.out>0) sub+=' · session avg '+(c.out/c.span).toFixed(1)+' tok/s';
+    push('rate', gFresh&&busy ? s.gen_rate : (s.rate||0));
+    B.push(stat('Generating now',bignum,unit,sub,null,null,spark('rate','#3ddc84')));
     let o='<div class="card"><div class="label">All time · '+t.sessions+' sessions</div>';
     o+='<div class="rowsplit"><span class="k">Input</span><span class="v">'+num(t['in'])+'</span></div>';
     o+='<div class="rowsplit"><span class="k">Output</span><span class="v">'+num(t.out)+'</span></div>';
