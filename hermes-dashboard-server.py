@@ -110,12 +110,14 @@ echo "load=$(cut -d' ' -f1 /proc/loadavg)"
 echo "uptime=$(cut -d. -f1 /proc/uptime)"
 echo "top=$(ps -eo pcpu,comm --sort=-pcpu --no-headers 2>/dev/null | head -3 | awk '{printf "%s %s|", $1, $2}')"
 # True generation speed straight from Ollama's own llama-server timings, which
-# it logs to the journal of whatever user runs `ollama serve`. This is the real
-# tok/s of the last completed response for ANY client, not just Hermes traffic,
-# and it lands in the journal within a moment of the response finishing.
-_uid=$(ps -o uid= -C ollama 2>/dev/null | awk 'NR==1{print $1}')
-[ -n "$_uid" ] || _uid=0
-_g=$(journalctl _UID=$_uid -o short-unix --no-pager -n 400 2>/dev/null | grep 'eval time =' | grep -v 'prompt eval time' | tail -1)
+# it logs to the system journal (identifier "ollama"). This is the real tok/s of
+# the last completed response for ANY client, not just Hermes traffic, and it
+# lands in the journal within a moment of the response finishing. The grep runs
+# here on the box (only the final line crosses SSH), so -n can be generous — it
+# has to reach back past llama-server's very verbose per-request logging to the
+# last generation line. (journalctl --grep reorders results under -n on some
+# versions, so we filter chronological output client-side instead.)
+_g=$(journalctl -t ollama -o short-unix --no-pager -n 3000 2>/dev/null | grep 'eval time =' | grep -v 'prompt eval time' | tail -1)
 echo "gen_rate=$(printf '%s' "$_g" | sed -n 's/.*, *\([0-9.]*\) tokens per second.*/\1/p')"
 echo "gen_ts=$(printf '%s' "$_g" | awk '{print $1}' | cut -d. -f1)"
 """
@@ -441,7 +443,9 @@ def poller():
             try:
                 gr = float(pc.get("gen_rate") or 0)
                 gts = float(pc.get("gen_ts") or 0)
-                if gr > 0 and gts > 0:
+                # Ignore a rate older than an hour: past that the box has been
+                # idle and "last response 3h ago" is just noise, so fall to idle.
+                if gr > 0 and gts > 0 and (t0 - gts) < 3600:
                     gen_rate, gen_age = gr, max(0.0, t0 - gts)
             except (TypeError, ValueError):
                 pass
