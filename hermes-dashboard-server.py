@@ -13,6 +13,7 @@ Stdlib only — no pip install.
 """
 
 import argparse
+import base64
 import json
 import os
 import socket
@@ -122,6 +123,71 @@ echo "gen_rate=$(printf '%s' "$_g" | sed -n 's/.*, *\([0-9.]*\) tokens per secon
 echo "gen_ts=$(printf '%s' "$_g" | awk '{print $1}' | cut -d. -f1)"
 """
 
+# The same box may be booted into Windows. Windows needs a completely different
+# probe (no /sys, no /proc, no journald), but it must emit the SAME keys in the
+# SAME units so the rest of the dashboard does not care which OS answered:
+#   vram_* bytes · mem_* kB · *_temp millidegrees · cpu_freq kHz
+#   cpu_stat "cpu user nice system idle ..." in 1/100s jiffies
+# Temps/fan/power are absent: Windows exposes no vendor-neutral sensor API, so
+# those keys are simply omitted and the UI already renders them as "-".
+WIN_USER = os.environ.get("HERMES_WIN_SSH_USER", "user")
+
+PROBE_WIN = r"""
+$ErrorActionPreference='SilentlyContinue'; $ProgressPreference='SilentlyContinue'
+# Count only render/compute engines. Summing every engine double-counts and a
+# video-decode engine alone was reading 52% while the GPU was otherwise idle.
+$gs = (Get-Counter '\GPU Engine(*)\Utilization Percentage' -EA 0).CounterSamples |
+      Where-Object { $_.InstanceName -match 'engtype_(3D|Compute)' }
+$busy = 0; if($gs){ $busy = [math]::Min(100,[math]::Round(($gs | Measure-Object CookedValue -Sum).Sum,0)) }
+"gpu_busy=$busy"
+$vm = (Get-Counter '\GPU Process Memory(*)\Dedicated Usage' -EA 0).CounterSamples
+if($vm){ "vram_used=$([int64](($vm | Measure-Object CookedValue -Sum).Sum))" }
+$vt = 0
+Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}' -EA 0 |
+  ForEach-Object { $q = (Get-ItemProperty $_.PSPath -EA 0).'HardwareInformation.qwMemorySize'
+                   if($q -and $q -gt $vt){ $vt = [int64]$q } }
+if($vt){ "vram_total=$vt" }
+$os = Get-CimInstance Win32_OperatingSystem
+"mem_total=$($os.TotalVisibleMemorySize)"
+"mem_avail=$($os.FreePhysicalMemory)"
+# Cumulative 100ns counters -> /proc/stat jiffies, so the existing delta maths works.
+$c = Get-CimInstance Win32_PerfRawData_PerfOS_Processor -Filter "Name='_Total'"
+if($c){ "cpu_stat=cpu $([int64]($c.PercentUserTime/100000)) 0 $([int64]($c.PercentPrivilegedTime/100000)) $([int64]($c.PercentIdleTime/100000)) 0 0 0" }
+$p = Get-CimInstance Win32_Processor | Select-Object -First 1
+"cpu_model=$($p.Name)"
+"ncpu=$($p.NumberOfLogicalProcessors)"
+"cpu_freq=$([int]$p.CurrentClockSpeed * 1000)"
+"uptime=$([int]((Get-Date) - $os.LastBootUpTime).TotalSeconds)"
+$q = (Get-Counter '\System\Processor Queue Length' -EA 0).CounterSamples.CookedValue
+"load=$([math]::Round($(if($q){$q}else{0}),2))"
+"top=$((Get-Process | Sort-Object CPU -Descending | Select-Object -First 3 | ForEach-Object { '{0:N1} {1}|' -f $_.CPU,$_.ProcessName }) -join '')"
+# Ollama's own llama-server timings, same figure the Linux side reads from journald.
+$best=$null
+Get-ChildItem "$env:LOCALAPPDATA\Ollama\server*.log" -EA 0 | Sort-Object LastWriteTime -Descending | ForEach-Object {
+  if(-not $best){
+    $l = Get-Content $_.FullName -Tail 3000 -EA 0 |
+         Where-Object { $_ -match 'eval time =' -and $_ -notmatch 'prompt eval time' } | Select-Object -Last 1
+    if($l -and $l -match '([0-9.]+) tokens per second'){
+      $best = $matches[1]
+      "gen_rate=$best"
+      "gen_ts=$([int](Get-Date -UFormat %s))"
+    }
+  }
+}
+"""
+
+
+def _win_cmd(ps):
+    """Windows commands go over ssh base64-encoded.
+
+    The remote default shell is PowerShell, and passing a multi-line script as a
+    plain ssh argument gets mangled by two layers of quoting (and by any
+    non-ASCII character, which silently truncates the script). -EncodedCommand
+    takes UTF-16LE base64 and sidesteps all of it.
+    """
+    return "powershell -NoProfile -EncodedCommand " + base64.b64encode(
+        ps.encode("utf-16-le")).decode()
+
 def _magic(mac):
     return b"\xff" * 6 + bytes.fromhex(mac.replace(":", "").replace("-", "")) * 16
 
@@ -216,14 +282,29 @@ def power_action(action):
     though the action succeeded.
     """
     if action == "suspend":
-        cmd, done = "systemctl suspend", "suspending — wake should bring it back"
+        done = "suspending — wake should bring it back"
     elif action == "poweroff":
-        cmd, done = "systemctl poweroff", "powering off"
+        done = "powering off"
     else:
         return False, "unknown action"
-    remote = "nohup sh -c 'sleep 1; %s' >/dev/null 2>&1 & echo queued" % cmd
+
+    if pc_os() == "windows":
+        # SetSuspendState(bHibernate=0) is a real S3 sleep, and it BLOCKS, so it
+        # is launched detached or ssh never gets its reply. shutdown /t 5 already
+        # returns immediately. Both print "queued" to match the Linux contract.
+        if action == "suspend":
+            ps = ("Start-Process -WindowStyle Hidden rundll32.exe "
+                  "-ArgumentList 'powrprof.dll,SetSuspendState','0,1,0'; 'queued'")
+        else:
+            ps = "shutdown /s /t 5 | Out-Null; 'queued'"
+        target, remote = WIN_USER + "@" + HOST, _win_cmd(ps)
+    else:
+        cmd = "systemctl suspend" if action == "suspend" else "systemctl poweroff"
+        target = "root@" + HOST
+        remote = "nohup sh -c 'sleep 1; %s' >/dev/null 2>&1 & echo queued" % cmd
+
     try:
-        r = subprocess.run(["ssh", *SSH_OPTS, "root@" + HOST, remote],
+        r = subprocess.run(["ssh", *SSH_OPTS, target, remote],
                            capture_output=True, text=True, timeout=15)
         if r.returncode == 0 and "queued" in r.stdout:
             return True, done
@@ -236,20 +317,47 @@ _snapshot = {"ok": False, "error": "starting up"}
 _lock = threading.Lock()
 
 
-def probe_pc():
-    try:
-        r = subprocess.run(["ssh", *SSH_OPTS, "root@" + HOST, PROBE],
-                           capture_output=True, text=True, timeout=12)
-        if r.returncode != 0:
-            return None
-        d = {}
-        for line in r.stdout.splitlines():
-            if "=" in line:
-                k, _, v = line.partition("=")
-                d[k.strip()] = v.strip()
-        return d or None
-    except (subprocess.TimeoutExpired, OSError):
+# Which OS answered last. The box dual-boots, so this flips at runtime; we try
+# the remembered one first and fall back to the other, which means a reboot into
+# the other OS costs one wasted ssh attempt and then self-heals. No config.
+_os_kind = None
+
+
+def pc_os():
+    """Last known OS of the PC: 'linux', 'windows', or None if never reached."""
+    return _os_kind
+
+
+def _probe_kind(kind):
+    if kind == "windows":
+        target, cmd, tmo = WIN_USER + "@" + HOST, _win_cmd(PROBE_WIN), 25
+    else:
+        target, cmd, tmo = "root@" + HOST, PROBE, 12
+    r = subprocess.run(["ssh", *SSH_OPTS, target, cmd],
+                       capture_output=True, text=True, timeout=tmo)
+    if r.returncode != 0:
         return None
+    d = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            d[k.strip()] = v.strip()
+    return d or None
+
+
+def probe_pc():
+    global _os_kind
+    order = [_os_kind] if _os_kind else []
+    order += [k for k in ("linux", "windows") if k not in order]
+    for kind in order:
+        try:
+            d = _probe_kind(kind)
+        except (subprocess.TimeoutExpired, OSError):
+            d = None
+        if d:
+            _os_kind = kind
+            return d
+    return None
 
 
 def probe_ollama():
