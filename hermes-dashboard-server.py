@@ -742,10 +742,22 @@ const dur=s=>{s=Math.max(0,Math.round(s));const d=Math.floor(s/86400),h=Math.flo
   return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m');};
 const col=p=>p<60?'var(--grn)':(p<85?'var(--yel)':'var(--red)');
 
-function spark(key,color){
+// Every series gets a fixed domain so its shape means the same thing on every
+// card and from one minute to the next. Percentages and watts use the same domain
+// as the card's own progress bar; temperatures use a 30-95 C band rather than the
+// bar's 0-95, because an idle-to-load swing lives in the top third of a 0 C scale.
+// The old auto-range rescaled to whatever the last 60 samples happened to contain,
+// so a 3% idle wobble drew the same full-height spike as real 0-100% load, and no
+// two cards — or two moments — were comparable.
+// lo/hi omitted falls back to a padded auto-range, for unbounded series like tok/s.
+function spark(key,color,lo,hi){
   const a=H[key];if(a.length<2)return'';
-  const mx=Math.max(...a,1),mn=Math.min(...a,0),rg=(mx-mn)||1,W=100,Hh=38;
-  const pts=a.map((v,i)=>[(i/(a.length-1))*W,Hh-((v-mn)/rg)*(Hh-5)-2]);
+  let mn,mx;
+  if(lo!=null){mn=lo;mx=hi;}
+  else{const d0=Math.min(...a),d1=Math.max(...a),pad=((d1-d0)||1)*0.15;mn=d0-pad;mx=d1+pad;}
+  const rg=(mx-mn)||1,W=100,Hh=38;
+  const pts=a.map((v,i)=>[(i/(a.length-1))*W,
+    Hh-Math.max(0,Math.min(1,(v-mn)/rg))*(Hh-5)-2]);
   const d=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(2)+' '+p[1].toFixed(2)).join(' ');
   const area=d+' L'+W+' '+Hh+' L0 '+Hh+' Z';
   const id='g'+key;
@@ -763,6 +775,30 @@ const stat=(label,val,unit,meta,pct,color,sp)=>
   (meta?'<div class="meta">'+meta+'</div>':'')+
   (pct!=null?'<div class="track"><div class="fill" style="width:'+Math.min(100,pct)+'%;background:'+(color||col(pct))+'"></div></div>':'')+
   (sp||'')+'</div>';
+
+// Patch the live DOM instead of replacing it. innerHTML on every 2s tick threw
+// away scroll position, any text selection, keyboard focus, and — worst — the
+// .armed state and pending timeout that make Shut down a two-step confirm, so the
+// confirm only survived if both clicks landed inside the same 2s window.
+// Nodes marked data-keep are rendered once and never touched again.
+function morph(dst,src){
+  const dn=dst.childNodes,sn=src.childNodes;
+  while(dn.length>sn.length)dst.removeChild(dst.lastChild);
+  for(let i=0;i<sn.length;i++){
+    const n=sn[i],o=dn[i];
+    if(!o){dst.appendChild(n.cloneNode(true));continue;}
+    if(o.nodeType!==n.nodeType||o.nodeName!==n.nodeName){
+      dst.replaceChild(n.cloneNode(true),o);continue;}
+    if(n.nodeType===3){if(o.nodeValue!==n.nodeValue)o.nodeValue=n.nodeValue;continue;}
+    if(n.nodeType!==1)continue;
+    if(o.hasAttribute('data-keep'))continue;
+    for(const a of Array.from(n.attributes))
+      if(o.getAttribute(a.name)!==a.value)o.setAttribute(a.name,a.value);
+    for(const a of Array.from(o.attributes))
+      if(!n.hasAttribute(a.name))o.removeAttribute(a.name);
+    morph(o,n);
+  }
+}
 
 async function tick(){
   let s;try{s=await(await fetch('/api/stats',{cache:'no-store'})).json();}
@@ -795,34 +831,34 @@ async function tick(){
     const vp=p.vram_used/p.vram_total*100, mp=p.mem_used/p.mem_total*100;
     push('busy',p.busy);push('temp',p.temp);push('vram',vp);push('mem',mp);
     B.push('<div class="grid g4">'+
-      stat('GPU load',p.busy.toFixed(0),'%','__GPU_LABEL__',p.busy,null,spark('busy','#5aa9ff'))+
-      stat('VRAM',gib(p.vram_used),'GiB','of '+gib(p.vram_total)+' GiB',vp,null,spark('vram','#c98bff'))+
+      stat('GPU load',p.busy.toFixed(0),'%','__GPU_LABEL__',p.busy,null,spark('busy','#5aa9ff',0,100))+
+      stat('VRAM',gib(p.vram_used),'GiB','of '+gib(p.vram_total)+' GiB',vp,null,spark('vram','#c98bff',0,100))+
       stat('Temp',p.temp.toFixed(0),'°C',p.fan+' rpm · '+p.power.toFixed(0)+' W',
            Math.min(100,p.temp/95*100),p.temp<70?'var(--grn)':(p.temp<85?'var(--yel)':'var(--red)'),
-           spark('temp','#ffc857'))+
-      stat('RAM',gib(p.mem_used),'GiB','of '+gib(p.mem_total)+' GiB · load '+p.load.toFixed(2),mp,null,spark('mem','#c98bff'))+
+           spark('temp','#ffc857',30,95))+
+      stat('RAM',gib(p.mem_used),'GiB','of '+gib(p.mem_total)+' GiB · load '+p.load.toFixed(2),mp,null,spark('mem','#c98bff',0,100))+
       '</div>');
     push('cpuw',p.cpu_watts);push('cpup',p.cpu_pct);push('cput',p.cpu_temp);push('totw',p.total_watts);
     B.push('<div class="grid g4">'+
       stat('CPU load',p.cpu_pct!=null?p.cpu_pct.toFixed(0):'—','%',
            p.cpu_model||'CPU',
-           p.cpu_pct||0,null,spark('cpup','#5aa9ff'))+
+           p.cpu_pct||0,null,spark('cpup','#5aa9ff',0,100))+
       stat('CPU temp',p.cpu_temp?p.cpu_temp.toFixed(0):'—','°C',
            (p.ncpu?p.ncpu+' threads':'')+(p.cpu_freq?' · '+p.cpu_freq.toFixed(2)+' GHz':''),
            p.cpu_temp?Math.min(100,p.cpu_temp/95*100):0,
            !p.cpu_temp?null:(p.cpu_temp<70?'var(--grn)':(p.cpu_temp<85?'var(--yel)':'var(--red)')),
-           spark('cput','#ffc857'))+
+           spark('cput','#ffc857',30,95))+
       stat('CPU power',p.cpu_watts!=null?p.cpu_watts.toFixed(0):'—','W',
            'package · 142 W limit',
-           p.cpu_watts!=null?Math.min(100,p.cpu_watts/142*100):0,null,spark('cpuw','#3ddc84'))+
+           p.cpu_watts!=null?Math.min(100,p.cpu_watts/142*100):0,null,spark('cpuw','#3ddc84',0,142))+
       stat('System draw',p.total_watts!=null?p.total_watts.toFixed(0):'—','W',
            p.cpu_watts!=null?('cpu '+p.cpu_watts.toFixed(0)+' W · gpu '+p.power.toFixed(0)+' W · est.'):'',
            p.total_watts!=null?Math.min(100,p.total_watts/750*100):0,null,
-           spark('totw','#3ddc84'))+
+           spark('totw','#3ddc84',0,750))+
       '</div>');
 
     B.push('<div class="grid g1">');
-    B.push('<div class="card"><div class="label">Power</div>'+
+    B.push('<div class="card" data-keep><div class="label">Power</div>'+
       '<div class="power">'+
       '<button class="pw" data-act="suspend" onclick="doPower(this)">Suspend</button>'+
       '<button class="pw danger" data-act="poweroff" onclick="doPower(this)">Shut down</button>'+
@@ -919,7 +955,8 @@ async function tick(){
     }
     B.push(o);
   }
-  document.getElementById('body').innerHTML=B.join('');
+  const next=document.createElement('div');next.innerHTML=B.join('');
+  morph(document.getElementById('body'),next);
   document.getElementById('sub').textContent='__PC_HOST__ · over Tailscale · updated '+
     new Date(s.ts*1000).toLocaleTimeString();
 }
