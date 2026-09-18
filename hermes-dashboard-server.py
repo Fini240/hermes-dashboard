@@ -110,6 +110,23 @@ echo "ncpu=$(nproc)"
 echo "load=$(cut -d' ' -f1 /proc/loadavg)"
 echo "uptime=$(cut -d. -f1 /proc/uptime)"
 echo "top=$(ps -eo pcpu,comm --sort=-pcpu --no-headers 2>/dev/null | head -3 | awk '{printf "%s %s|", $1, $2}')"
+# Are the monitors lit? Every connected DRM connector carries its own DPMS
+# state, and the compositor's blanking lands here, so this reads the truth
+# whoever turned them off — the dashboard, the screen locker, or a key press
+# at the desk. Filter on `status` only, NOT on `enabled`: blanking disables
+# the CRTC, so a blanked display reports enabled=disabled and would vanish
+# from the count entirely. (Writeback-1 is a virtual connector: status=unknown,
+# so it drops out on its own.)
+_mon_on=0; _mon_off=0
+for c in /sys/class/drm/card*-*/; do
+  [ "$(cat "$c/status" 2>/dev/null)" = connected ] || continue
+  case "$(cat "$c/dpms" 2>/dev/null)" in
+    On) _mon_on=$((_mon_on+1)) ;;
+    Off) _mon_off=$((_mon_off+1)) ;;
+  esac
+done
+echo "mon_on=$_mon_on"
+echo "mon_off=$_mon_off"
 # True generation speed straight from Ollama's own llama-server timings, which
 # it logs to the system journal (identifier "ollama"). This is the real tok/s of
 # the last completed response for ANY client, not just Hermes traffic, and it
@@ -272,6 +289,71 @@ def wake():
     if ok2:
         return True, msg2
     return False, "away from home and both relays failed: %s / %s" % (msg, msg2)
+
+
+# Blanking the monitors is a DPMS change inside whatever compositor owns the
+# seat, so it cannot be done by writing sysfs over ssh: the running KMS master
+# (here plasmalogin's KWin on the greeter session) owns the connectors and
+# overrides anything written behind its back. So find seat0's active session,
+# then speak to that session as its own user. Reading the state back IS a plain
+# sysfs read, which is why the probe gets a live indicator for free.
+#
+# The session is resolved on every call rather than baked in: the active
+# session is the greeter while nobody is logged in and the desktop user's
+# afterwards, and each has its own uid and wayland socket.
+DISPLAY_SH = r"""
+act=__ACT__
+sess=$(loginctl show-seat seat0 -p ActiveSession --value 2>/dev/null)
+[ -n "$sess" ] || sess=$(loginctl list-sessions --no-legend 2>/dev/null | awk '$4=="seat0"{print $1;exit}')
+[ -n "$sess" ] || { echo "no graphical session on seat0" >&2; exit 1; }
+uid=$(loginctl show-session "$sess" -p User --value)
+usr=$(loginctl show-session "$sess" -p Name --value)
+typ=$(loginctl show-session "$sess" -p Type --value)
+rt=/run/user/$uid
+if [ "$typ" = wayland ]; then
+  wd=$(ls "$rt" 2>/dev/null | grep -m1 '^wayland-[0-9]*$')
+  [ -n "$wd" ] || { echo "session $sess has no wayland socket" >&2; exit 1; }
+  runuser -u "$usr" -- env XDG_RUNTIME_DIR="$rt" WAYLAND_DISPLAY="$wd" \
+      kscreen-doctor --dpms $act >/dev/null 2>&1 \
+    || { echo "kscreen-doctor --dpms $act failed in session $sess" >&2; exit 1; }
+else
+  dsp=$(loginctl show-session "$sess" -p Display --value); [ -n "$dsp" ] || dsp=:0
+  xa=$(ls "$rt"/xauth* 2>/dev/null | head -1)
+  runuser -u "$usr" -- env DISPLAY="$dsp" XAUTHORITY="$xa" xset dpms force $act >/dev/null 2>&1 \
+    || { echo "xset dpms force $act failed on $dsp" >&2; exit 1; }
+fi
+echo queued
+"""
+
+
+def display_action(action):
+    """Blank or unblank the PC's monitors. Returns (ok, message).
+
+    Unlike suspend this leaves the machine fully awake and on the network: it
+    only stops the panels drawing, which is where nearly all of the idle wattage
+    of a desk setup actually goes. Any key press or mouse move at the PC wakes
+    them again, and the indicator follows that because it is read from sysfs.
+    """
+    if action not in ("on", "off"):
+        return False, "unknown action"
+    if pc_os() == "windows":
+        # An ssh session on Windows lands outside the interactive desktop, so
+        # the SC_MONITORPOWER broadcast never reaches the session that owns the
+        # displays. Nothing to do short of a helper task running as the logged-in
+        # user, so say so rather than failing cryptically.
+        return False, ("monitor control is Linux-only — an ssh session on Windows "
+                       "cannot reach the desktop that owns the displays")
+    remote = DISPLAY_SH.replace("__ACT__", action)
+    try:
+        r = subprocess.run(["ssh", *SSH_OPTS, "root@" + HOST, remote],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode == 0 and "queued" in r.stdout:
+            return True, ("monitors off — the PC stays awake and online; a key press "
+                          "or mouse move at the PC brings them back"
+                          if action == "off" else "monitors on")
+        return False, (r.stderr or r.stdout or "command failed").strip().splitlines()[-1][:160]
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, str(e)[:160]
 
 
 def power_action(action):
@@ -558,8 +640,25 @@ def poller():
             except (TypeError, ValueError):
                 pass
 
+        # on / off / mixed for the monitors, or None when it cannot be known
+        # (PC unreachable, booted into Windows, or no display attached at all).
+        monitors = None
+        if pc:
+            try:
+                m_on = int(pc.get("mon_on") or 0)
+                m_off = int(pc.get("mon_off") or 0)
+                if m_on and m_off:
+                    monitors = "mixed"
+                elif m_on:
+                    monitors = "on"
+                elif m_off:
+                    monitors = "off"
+            except (TypeError, ValueError):
+                pass
+
         snap = {"ok": True, "ts": t0,
                 "online": pc is not None or oll is not None,
+                "monitors": monitors,
                 # ssh reachable, so GPU/CPU/RAM figures are available.
                 "host_stats": pc is not None,
                 "rate": rate,
@@ -713,6 +812,11 @@ button.pw:hover{color:var(--fg);border-color:var(--faint)}
 button.pw.armed{color:#04160b;background:var(--yel);border-color:var(--yel)}
 button.pw.danger.armed{color:#fff;background:var(--red);border-color:var(--red)}
 button.pw:disabled{opacity:.5;cursor:default}
+/* The status dot doubles as the monitors button's indicator, so it has to sit
+   on the text baseline rather than float in a pill of its own. */
+button.pw .dot{display:inline-block;vertical-align:-1px;margin-right:8px}
+button.pw .dot.dim{background:var(--faint);box-shadow:0 0 0 3px rgba(90,99,117,.16)}
+button.pw .dot.mix{background:var(--yel);box-shadow:0 0 0 3px rgba(255,200,87,.16)}
 footer{color:var(--faint);font-size:12px;margin-top:30px;text-align:center}
 </style></head><body><div class="wrap">
 <header><h1>__PC_NAME__</h1><span class="pill" id="status"><i class="dot"></i>connecting</span></header>
@@ -862,9 +966,15 @@ async function tick(){
       '<div class="power">'+
       '<button class="pw" data-act="suspend" onclick="doPower(this)">Suspend</button>'+
       '<button class="pw danger" data-act="poweroff" onclick="doPower(this)">Shut down</button>'+
+      // No arm/confirm on this one: it is instantly reversible and costs nothing
+      // if mis-clicked, unlike the two beside it. Label and dot are driven by
+      // syncMonitors() from the live sysfs reading, never by what we just sent.
+      '<button class="pw mon" id="monbtn" onclick="doMonitors(this)">'+
+      '<i class="dot dim"></i><span>Monitors</span></button>'+
       '</div><div class="note" id="pwmsg">Suspend keeps the network card armed, so Wake '+
       'can bring it back. Shut down cuts power to the card — it will not wake until '+
-      'wake-on-LAN is enabled in the BIOS.</div></div>');
+      'wake-on-LAN is enabled in the BIOS. Monitors off blanks the displays only — the '+
+      'PC stays awake and online, and a key press at the desk lights them again.</div></div>');
     if(p.top&&p.top.length)
       B.push('<div class="card"><div class="label">Top processes · up '+dur(p.uptime)+'</div>'+
         p.top.map(t=>{const q=t.trim().split(/\s+/);
@@ -957,13 +1067,18 @@ async function tick(){
   }
   const next=document.createElement('div');next.innerHTML=B.join('');
   morph(document.getElementById('body'),next);
+  // The power card is data-keep, so morph() never touches its contents — the
+  // monitors indicator is updated by hand instead, after the card exists.
+  syncMonitors(s);
   document.getElementById('sub').textContent='__PC_HOST__ · over Tailscale · updated '+
     new Date(s.ts*1000).toLocaleTimeString();
 }
 async function doPower(b){
   const msg=document.getElementById('pwmsg'), act=b.dataset.act;
   if(!b.classList.contains('armed')){
-    document.querySelectorAll('button.pw').forEach(o=>{
+    // [data-act] only: the monitors button is a .pw too, and this would
+    // overwrite its dot and label with the word "Shut down".
+    document.querySelectorAll('button.pw[data-act]').forEach(o=>{
       o.classList.remove('armed');o.textContent=o.dataset.act==='suspend'?'Suspend':'Shut down';});
     b.classList.add('armed');
     b.textContent=act==='suspend'?'Confirm suspend':'Confirm shut down';
@@ -974,7 +1089,7 @@ async function doPower(b){
     return;
   }
   clearTimeout(b._t);
-  document.querySelectorAll('button.pw').forEach(o=>o.disabled=true);
+  document.querySelectorAll('button.pw[data-act]').forEach(o=>o.disabled=true);
   b.textContent='Sending…';
   try{
     const r=await(await fetch('/api/power',{method:'POST',
@@ -983,6 +1098,40 @@ async function doPower(b){
     if(msg)msg.textContent=r.message;
     b.textContent=r.ok?'Sent':'Failed';
   }catch(e){ if(msg)msg.textContent='Could not reach the dashboard server.'; b.textContent='Failed'; }
+}
+// Live state, straight from the poll. Says "on" only when the panels really are
+// lit, so waking them at the keyboard is reflected here within a tick.
+function syncMonitors(s){
+  const b=document.getElementById('monbtn'); if(!b||b._busy) return;
+  const d=b.querySelector('i'), t=b.querySelector('span'), m=s.monitors;
+  b.dataset.state=m||'na';
+  if(!m){
+    b.disabled=true; d.className='dot dim'; t.textContent='Monitors n/a';
+    b.title=s.host_stats?'No display is attached, or the PC is booted into Windows.'
+                        :'Needs the SSH probe, which is not answering.';
+    return;
+  }
+  b.disabled=false;
+  d.className='dot'+(m==='off'?' dim':(m==='mixed'?' mix':''));
+  t.textContent=m==='off'?'Monitors off':(m==='mixed'?'Monitors mixed':'Monitors on');
+  b.title=m==='off'?'Switch the monitors back on'
+                   :'Blank the monitors — the PC stays awake and online';
+}
+async function doMonitors(b){
+  const msg=document.getElementById('pwmsg');
+  // Anything that is not fully off means there is still something to blank.
+  const want=b.dataset.state==='off'?'on':'off';
+  b._busy=true; b.disabled=true;
+  b.querySelector('span').textContent=want==='off'?'Turning off…':'Turning on…';
+  try{
+    const r=await(await fetch('/api/display',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:want})})).json();
+    if(msg)msg.textContent=r.message;
+  }catch(e){ if(msg)msg.textContent='Could not reach the dashboard server.'; }
+  // Hand control back to the poll rather than assuming the change took: the
+  // next tick reads the real DPMS state and relabels the button from that.
+  setTimeout(()=>{b._busy=false;},2500);
 }
 async function doWake(){
   const b=document.querySelector('button.wake'), m=document.getElementById('wakemsg');
@@ -1032,6 +1181,13 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 action = ""
             ok, msg = power_action(action)
+        elif self.path.startswith("/api/display"):
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                action = json.loads(self.rfile.read(n) or b"{}").get("action", "")
+            except ValueError:
+                action = ""
+            ok, msg = display_action(action)
         elif self.path.startswith("/api/wake"):
             # direct=1 comes from another dashboard relaying to us: broadcast
             # locally only, never relay onward, so the two can't ping-pong.

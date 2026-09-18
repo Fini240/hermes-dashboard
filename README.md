@@ -1,8 +1,8 @@
 # hermes-dashboard
 
 A single-file browser dashboard for a remote Ollama box: live GPU/CPU/RAM/power,
-wake-on-LAN, suspend/shutdown, and Hermes token accounting. Stdlib-only Python —
-no pip install, no build step, no JS framework.
+wake-on-LAN, suspend/shutdown, monitor blanking, and Hermes token accounting.
+Stdlib-only Python — no pip install, no build step, no JS framework.
 
 Runs anywhere with Docker — a NAS, a mini PC, a Raspberry Pi — as long as it shares
 the monitored machine's LAN.
@@ -30,6 +30,7 @@ Your laptop can still run a copy; it will relay wake requests to the LAN-side on
 browser ──GET /──────────► PAGE_HTML   (static, placeholders substituted at startup)
         ──GET /api/stats─► _snapshot   (cached dict, never blocks on I/O)
         ──POST /api/wake─► magic packet, direct or relayed
+        ──POST /api/display► ssh <PC> kscreen-doctor --dpms on|off
                               ▲
    poller thread (2s) ────────┤  ssh <PC> sysfs probe  → GPU/CPU/RAM/power
                               │  GET /api/ps           → resident models
@@ -85,6 +86,34 @@ instead of drifting across forked copies. See `.env.example` for the annotated l
 | `HERMES_STATE_SYNC` | `user@host:/path/to/state.db`; blank disables token panels |
 | `HERMES_STATE_SYNC_SECONDS` | Token sync interval (default 15) |
 
+## Monitors off, machine on
+
+The Power card's third button blanks the PC's displays and leaves the machine fully
+awake and on the network. On a desk setup that is where most of the idle wattage
+actually sits — two panels easily outdraw an idling box — so it is the middle setting
+between "running with the screens lit" and "suspended and unreachable".
+
+- **It is a compositor operation, not a sysfs write.** The running KMS master owns the
+  connectors and overrides anything written behind its back. `display_action()` asks
+  logind for seat0's *active* session, then runs `kscreen-doctor --dpms` as that
+  session's own user against its Wayland socket (with an `xset` path for X11). The
+  session is resolved per call, because it is the greeter while nobody is logged in and
+  the desktop user's afterwards — different uid, different socket.
+- **The state is read back, never assumed.** Each connected DRM connector exposes its
+  own `dpms` attribute and the compositor's change lands there, so the probe reports the
+  truth whoever turned the screens off — this button, the lock screen, or a key press at
+  the desk. The button relabels itself from that reading on the next 2s poll.
+- **Filter connectors on `status`, not `enabled`.** Blanking disables the CRTC, so a
+  blanked display reports `enabled=disabled`; filtering on it makes the monitors
+  disappear from the count instead of reading "off".
+- **No arm/confirm step**, unlike its two neighbours: it is instantly reversible and
+  costs nothing if mis-clicked.
+- **Linux only.** An ssh session on Windows lands outside the interactive desktop, so
+  the `SC_MONITORPOWER` broadcast never reaches the session that owns the displays. The
+  button says `Monitors n/a` there rather than failing cryptically.
+- It does **not** hold off an idle-suspend timer on the PC. If the box is set to suspend
+  on idle, blanking the screens will not keep it up.
+
 ## The look
 
 Dark, flat, information-dense — readable at a glance from across the room.
@@ -104,6 +133,9 @@ Dark, flat, information-dense — readable at a glance from across the room.
   `preserveAspectRatio="none"` and `vector-effect="non-scaling-stroke"` so the line
   keeps its weight when the card is wide. 60 points of client-side history at 2s each.
   Do *not* anchor them to the card bottom — it squashes them in the four-up rows.
+- **The Power card is `data-keep`** — `morph()` never touches its contents, or a 2s tick
+  would wipe the arm/confirm state mid-click. Anything live inside it is therefore
+  updated by hand; `syncMonitors()` is the one that does so for the monitors indicator.
 - **The favicon is a status light.** An activity trace recoloured live: green healthy,
   amber when host metrics are missing, red when unreachable. The href is rewritten only
   when the colour changes; rewriting per tick makes Chrome re-fetch and flicker.
