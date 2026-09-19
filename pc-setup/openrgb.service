@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenRGB lighting server (RGB control for the hermes-dashboard)
+After=multi-user.target
+
+[Service]
+Type=simple
+# Detection needs the SMBus for the ASUS Aura controller; the USB devices are
+# hidraw and need nothing. "-" on piix4 because it may already be built in.
+ExecStartPre=/usr/bin/modprobe i2c-dev
+ExecStartPre=-/usr/bin/modprobe i2c-piix4
+ExecStart=/usr/bin/openrgb --server --server-port 6742
+# Re-apply the stored colour once the server is up, so a reboot does not leave
+# the lights on whatever the board firmware defaults to.
+ExecStartPost=-/usr/bin/systemd-run --unit=rgb-restore-once /usr/local/bin/rgb-restore
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

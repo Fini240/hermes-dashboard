@@ -1,0 +1,26 @@
+#!/bin/sh
+# Apply a lighting preset to every RGB controller in this PC and remember it.
+#   rgb-apply red|purple|blue|off
+# Talks to the running openrgb --server: a bare `openrgb` invocation re-detects
+# every controller first and takes ~22s, while the client path is under a second.
+STATE=/var/lib/hermes-rgb/state
+CLIENT="openrgb --client 127.0.0.1:6742"
+case "$1" in
+  red)    COL=FF0000 ;;
+  purple) COL=8000FF ;;
+  blue)   COL=0000FF ;;
+  off)    COL= ;;
+  *) echo "usage: rgb-apply red|purple|blue|off" >&2; exit 2 ;;
+esac
+
+if [ -z "$COL" ]; then
+  out=$($CLIENT --mode off 2>&1) || { echo "$out" | tail -1 >&2; exit 1; }
+else
+  # No single mode covers every controller: the Vengeance DRAM has no "static"
+  # and the Sapphire GPU has no "direct". Both passes together cover all seven,
+  # and each pass prints a harmless "mode not available" for the ones it skips.
+  out=$($CLIENT --mode static --color "$COL" 2>&1) || { echo "$out" | tail -1 >&2; exit 1; }
+  $CLIENT --mode direct --color "$COL" >/dev/null 2>&1
+fi
+mkdir -p "$(dirname "$STATE")" && printf "%s" "$1" > "$STATE"
+echo ok

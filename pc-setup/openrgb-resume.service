@@ -1,0 +1,12 @@
+[Unit]
+Description=Restart OpenRGB after resume
+After=suspend.target hibernate.target hybrid-sleep.target
+
+[Service]
+Type=oneshot
+# The server holds SMBus/hidraw handles that do not survive S3; restarting it
+# re-detects, and its ExecStartPost re-applies the stored colour.
+ExecStart=/usr/bin/systemctl restart openrgb.service
+
+[Install]
+WantedBy=suspend.target hibernate.target hybrid-sleep.target

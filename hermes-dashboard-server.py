@@ -127,6 +127,12 @@ for c in /sys/class/drm/card*-*/; do
 done
 echo "mon_on=$_mon_on"
 echo "mon_off=$_mon_off"
+# Lighting preset last applied by rgb-apply on the PC. There is no read-back
+# path in OpenRGB's CLI, so the PC records what it set and re-applies it after
+# a reboot or resume — which makes this file the honest answer to "what are the
+# lights doing", not a guess the dashboard keeps to itself.
+echo "rgb=$(cat /var/lib/hermes-rgb/state 2>/dev/null)"
+[ -x /usr/local/bin/rgb-apply ] && echo "rgb_avail=1" || echo "rgb_avail=0"
 # True generation speed straight from Ollama's own llama-server timings, which
 # it logs to the system journal (identifier "ollama"). This is the real tok/s of
 # the last completed response for ANY client, not just Hermes traffic, and it
@@ -352,6 +358,34 @@ def display_action(action):
                           "or mouse move at the PC brings them back"
                           if action == "off" else "monitors on")
         return False, (r.stderr or r.stdout or "command failed").strip().splitlines()[-1][:160]
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, str(e)[:160]
+
+
+RGB_COLORS = ("red", "purple", "blue", "off")
+
+
+def rgb_action(color):
+    """Set the PC's RGB lighting to a preset, or switch it off.
+
+    The work is done by `rgb-apply` on the PC rather than by a command composed
+    here, because it needs OpenRGB's server: a bare `openrgb` call re-detects
+    every controller first and takes ~22s, against well under a second through
+    the running server. That script also records what it applied and re-applies
+    it after a reboot or a resume, which is what makes the indicator truthful.
+    """
+    if color not in RGB_COLORS:
+        return False, "unknown colour"
+    if pc_os() == "windows":
+        return False, "RGB control is Linux-only — OpenRGB is set up on the Linux side"
+    try:
+        r = subprocess.run(["ssh", *SSH_OPTS, "root@" + HOST,
+                            "/usr/local/bin/rgb-apply " + color],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0 and "ok" in r.stdout:
+            return True, ("lights off" if color == "off" else "lights set to " + color)
+        err = (r.stderr or r.stdout or "command failed").strip().splitlines()
+        return False, (err[-1] if err else "command failed")[:160]
     except (subprocess.TimeoutExpired, OSError) as e:
         return False, str(e)[:160]
 
@@ -659,6 +693,10 @@ def poller():
         snap = {"ok": True, "ts": t0,
                 "online": pc is not None or oll is not None,
                 "monitors": monitors,
+                # Lighting preset, or None when it cannot be known: PC down,
+                # booted into Windows, or OpenRGB not set up on it.
+                "rgb": ((pc.get("rgb") or None)
+                        if pc and pc.get("rgb_avail") == "1" else None),
                 # ssh reachable, so GPU/CPU/RAM figures are available.
                 "host_stats": pc is not None,
                 "rate": rate,
@@ -817,6 +855,19 @@ button.pw:disabled{opacity:.5;cursor:default}
 button.pw .dot{display:inline-block;vertical-align:-1px;margin-right:8px}
 button.pw .dot.dim{background:var(--faint);box-shadow:0 0 0 3px rgba(90,99,117,.16)}
 button.pw .dot.mix{background:var(--yel);box-shadow:0 0 0 3px rgba(255,200,87,.16)}
+/* RGB presets. The swatch IS the control: clicking one sets that colour,
+   clicking the button anywhere else switches the lights off. Unselected
+   swatches are dimmed so the current preset reads at a glance from across the
+   room, the same job the monitors dot does. */
+button.pw .sw{display:inline-block;width:13px;height:13px;border-radius:50%;
+  vertical-align:-2px;margin-right:6px;cursor:pointer;opacity:.42;
+  border:1px solid rgba(255,255,255,.14);transition:opacity .15s,box-shadow .15s}
+button.pw .sw:hover{opacity:.8}
+button.pw .sw.on{opacity:1;box-shadow:0 0 0 3px rgba(255,255,255,.14)}
+button.pw .sw[data-c=red]{background:#ff2d2d}
+button.pw .sw[data-c=purple]{background:#8000ff}
+button.pw .sw[data-c=blue]{background:#2d6bff}
+button.pw .sw:last-of-type{margin-right:9px}
 footer{color:var(--faint);font-size:12px;margin-top:30px;text-align:center}
 </style></head><body><div class="wrap">
 <header><h1>__PC_NAME__</h1><span class="pill" id="status"><i class="dot"></i>connecting</span></header>
@@ -971,10 +1022,20 @@ async function tick(){
       // syncMonitors() from the live sysfs reading, never by what we just sent.
       '<button class="pw mon" id="monbtn" onclick="doMonitors(this)">'+
       '<i class="dot dim"></i><span>Monitors</span></button>'+
+      // One button, four targets: each swatch sets its colour, and the button
+      // itself — anywhere beside a swatch — turns the lighting off. The swatch
+      // handlers stop propagation so they do not also fire that.
+      '<button class="pw rgb" id="rgbbtn" onclick="doRgb(\'off\')">'+
+      ['red','purple','blue'].map(c=>
+        '<span class="sw" data-c="'+c+'" onclick="event.stopPropagation();doRgb(\''+c+'\')"></span>'
+      ).join('')+
+      '<span>RGB</span></button>'+
       '</div><div class="note" id="pwmsg">Suspend keeps the network card armed, so Wake '+
       'can bring it back. Shut down cuts power to the card — it will not wake until '+
       'wake-on-LAN is enabled in the BIOS. Monitors off blanks the displays only — the '+
-      'PC stays awake and online, and a key press at the desk lights them again.</div></div>');
+      'PC stays awake and online, and a key press at the desk lights them again. '+
+      'On the RGB button a swatch sets that colour — clicking the button beside the '+
+      'swatches switches the lighting off.</div></div>');
     if(p.top&&p.top.length)
       B.push('<div class="card"><div class="label">Top processes · up '+dur(p.uptime)+'</div>'+
         p.top.map(t=>{const q=t.trim().split(/\s+/);
@@ -1070,6 +1131,7 @@ async function tick(){
   // The power card is data-keep, so morph() never touches its contents — the
   // monitors indicator is updated by hand instead, after the card exists.
   syncMonitors(s);
+  syncRgb(s);
   document.getElementById('sub').textContent='__PC_HOST__ · over Tailscale · updated '+
     new Date(s.ts*1000).toLocaleTimeString();
 }
@@ -1133,6 +1195,38 @@ async function doMonitors(b){
   // next tick reads the real DPMS state and relabels the button from that.
   setTimeout(()=>{b._busy=false;},2500);
 }
+// Same contract as the monitors indicator: this is what the PC last applied and
+// re-applies for itself after a reboot, not a value the page remembers.
+function syncRgb(s){
+  const b=document.getElementById('rgbbtn'); if(!b||b._busy) return;
+  const t=b.querySelector('span:last-of-type'), c=s.rgb;
+  b.dataset.state=c||'na';
+  if(!c){
+    b.disabled=true; t.textContent='RGB n/a';
+    b.title=s.host_stats?'OpenRGB is not set up on this machine, or it is booted into Windows.'
+                        :'Needs the SSH probe, which is not answering.';
+  }else{
+    b.disabled=false;
+    t.textContent=c==='off'?'RGB off':'RGB '+c;
+    b.title='Click a colour to set it · click here to switch the lighting off';
+  }
+  b.querySelectorAll('.sw').forEach(w=>
+    w.classList.toggle('on',w.dataset.c===c));
+}
+async function doRgb(color){
+  const b=document.getElementById('rgbbtn'), msg=document.getElementById('pwmsg');
+  if(b.disabled) return;
+  b._busy=true;
+  b.querySelector('span:last-of-type').textContent=color==='off'?'Off…':color+'…';
+  try{
+    const r=await(await fetch('/api/rgb',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({color:color})})).json();
+    if(msg)msg.textContent=r.message;
+  }catch(e){ if(msg)msg.textContent='Could not reach the dashboard server.'; }
+  // Hand back to the poll, which reads the PC's own record of what it applied.
+  setTimeout(()=>{b._busy=false;},4000);
+}
 async function doWake(){
   const b=document.querySelector('button.wake'), m=document.getElementById('wakemsg');
   if(b){b.disabled=true;b.textContent='Sending magic packet…';}
@@ -1188,6 +1282,13 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 action = ""
             ok, msg = display_action(action)
+        elif self.path.startswith("/api/rgb"):
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                color = json.loads(self.rfile.read(n) or b"{}").get("color", "")
+            except ValueError:
+                color = ""
+            ok, msg = rgb_action(color)
         elif self.path.startswith("/api/wake"):
             # direct=1 comes from another dashboard relaying to us: broadcast
             # locally only, never relay onward, so the two can't ping-pong.

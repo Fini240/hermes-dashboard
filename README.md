@@ -1,8 +1,8 @@
 # hermes-dashboard
 
 A single-file browser dashboard for a remote Ollama box: live GPU/CPU/RAM/power,
-wake-on-LAN, suspend/shutdown, monitor blanking, and Hermes token accounting.
-Stdlib-only Python — no pip install, no build step, no JS framework.
+wake-on-LAN, suspend/shutdown, monitor blanking, RGB lighting, and Hermes token
+accounting. Stdlib-only Python — no pip install, no build step, no JS framework.
 
 Runs anywhere with Docker — a NAS, a mini PC, a Raspberry Pi — as long as it shares
 the monitored machine's LAN.
@@ -31,6 +31,7 @@ browser ──GET /──────────► PAGE_HTML   (static, placeh
         ──GET /api/stats─► _snapshot   (cached dict, never blocks on I/O)
         ──POST /api/wake─► magic packet, direct or relayed
         ──POST /api/display► ssh <PC> kscreen-doctor --dpms on|off
+        ──POST /api/rgb────► ssh <PC> rgb-apply red|purple|blue|off
                               ▲
    poller thread (2s) ────────┤  ssh <PC> sysfs probe  → GPU/CPU/RAM/power
                               │  GET /api/ps           → resident models
@@ -53,6 +54,8 @@ serve the cached dict, so the page never waits on SSH.
    Enable with `ethtool -s <iface> wol g` and make it persist across reboots.
 4. AMD GPUs report through `/sys/class/drm/card*/device/gpu_busy_percent`. NVIDIA does
    not — the probe in `PROBE` needs replacing with `nvidia-smi` for those cards.
+5. For the RGB button, install what is in `pc-setup/` — see *RGB lighting* below.
+   Without it the button simply reads `RGB n/a`.
 
 **On the host that will run the dashboard:**
 
@@ -114,6 +117,49 @@ between "running with the screens lit" and "suspended and unreachable".
 - It does **not** hold off an idle-suspend timer on the PC. If the box is set to suspend
   on idle, blanking the screens will not keep it up.
 
+## RGB lighting
+
+The fourth Power button carries three swatches — red, purple, blue. Clicking a swatch
+sets that colour on every controller in the machine; clicking the button *beside* the
+swatches switches the lighting off. The active swatch is the one that is lit, so the
+button reports the current preset without a separate indicator.
+
+Everything hardware-facing lives on the PC, in `pc-setup/`:
+
+| File | Goes to | |
+|---|---|---|
+| `rgb-apply` | `/usr/local/bin/` | Applies a preset and records it |
+| `rgb-restore` | `/usr/local/bin/` | Re-applies the recorded preset |
+| `openrgb.service` | `/etc/systemd/system/` | OpenRGB in server mode |
+| `openrgb-resume.service` | `/etc/systemd/system/` | Restarts it after resume |
+
+```sh
+pacman -S openrgb                     # or your distro's package
+install -m755 pc-setup/rgb-* /usr/local/bin/
+cp pc-setup/openrgb*.service /etc/systemd/system/
+systemctl enable --now openrgb.service openrgb-resume.service
+```
+
+Why it is built that way:
+
+- **The server mode is not optional.** A bare `openrgb --mode …` re-detects every
+  controller before doing anything — 22 seconds on this machine. Against a running
+  `openrgb --server`, the same change takes under a second, which is the difference
+  between a button and a chore.
+- **Two passes, not one.** No single mode covers every controller: Corsair Vengeance
+  DRAM offers no `static`, and the Sapphire GPU offers no `direct`. `rgb-apply` sends
+  both and lets each controller ignore the one it does not implement. `--mode off`
+  *is* supported by all of them.
+- **The PC owns the state, not the dashboard.** OpenRGB's CLI cannot read a colour
+  back, so `rgb-apply` records what it set under `/var/lib/hermes-rgb/state` and the
+  probe reads that file. The same file is what `rgb-restore` replays, so the lighting
+  survives a reboot (the board would otherwise return to its firmware effect) and a
+  resume (the server loses its SMBus and hidraw handles across S3). A value the
+  dashboard merely remembered would go stale in exactly those two cases.
+- **Caveat:** if the lighting is changed by something else — the BIOS, or Windows on
+  the other boot — that file is no longer the truth. It is what this machine last
+  applied, not a read-back.
+
 ## The look
 
 Dark, flat, information-dense — readable at a glance from across the room.
@@ -174,3 +220,4 @@ These each cost real debugging time.
 | `Dockerfile` | `python:3.12-alpine` + `openssh-client` |
 | `docker-compose.yml` | Host networking, `.env`, ssh + state volumes |
 | `.env.example` | Annotated settings template |
+| `pc-setup/` | What goes *on the monitored PC* for RGB control |

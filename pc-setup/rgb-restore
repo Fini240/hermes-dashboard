@@ -1,0 +1,13 @@
+#!/bin/sh
+# Re-apply the last preset set from the dashboard. Run after the server starts
+# and after resume, because the lights fall back to the board firmware default
+# across a power cycle and the server loses its device handles across S3.
+s=$(cat /var/lib/hermes-rgb/state 2>/dev/null)
+[ -n "$s" ] || exit 0
+# Server startup detection takes ~20s, so wait for it rather than racing it.
+i=0
+while [ $i -lt 40 ]; do
+  openrgb --client 127.0.0.1:6742 --list-devices >/dev/null 2>&1 && break
+  i=$((i+1)); sleep 2
+done
+exec /usr/local/bin/rgb-apply "$s"
