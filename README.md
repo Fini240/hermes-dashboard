@@ -120,7 +120,7 @@ between "running with the screens lit" and "suspended and unreachable".
 
 ## RGB lighting
 
-The fourth Power button carries three swatches — red, purple, blue. Clicking a swatch
+The fourth Power button carries four swatches — red, purple, blue, green. Clicking a swatch
 sets that colour on every controller in the machine; clicking the button *beside* the
 swatches switches the lighting off. The active swatch is the one that is lit, so the
 button reports the current preset without a separate indicator.
@@ -131,7 +131,7 @@ Everything hardware-facing lives on the PC, in `pc-setup/`:
 |---|---|---|
 | `rgb-apply` | `/usr/local/bin/` | Applies a preset and records it |
 | `rgb-restore` | `/usr/local/bin/` | Sizes the zones, re-applies the preset |
-| `rgb-auto` | `/usr/local/bin/` | Loop: red while working, blue while idle |
+| `rgb-auto` | `/usr/local/bin/` | Loop: red while working, green while idle |
 | `rgb-auto.service` | `/etc/systemd/system/` | The Auto toggle enables/disables this |
 | `openrgb.service` | `/etc/systemd/system/` | OpenRGB in server mode |
 | `openrgb-resume.service` | `/etc/systemd/system/` | Restarts it after resume |
@@ -146,7 +146,7 @@ systemctl enable --now openrgb.service openrgb-resume.service
 ### The Auto toggle
 
 Next to the swatches, `Auto` hands the lighting to the PC: **red while it is working,
-blue while it is idle**. Picking a colour by hand switches Auto back off — leaving both
+green while it is idle**. Picking a colour by hand switches Auto back off — leaving both
 on would mean the daemon quietly reverting the choice at the next load transition, which
 reads as a broken button.
 
@@ -158,8 +158,8 @@ The dashboard only flips the switch and reports `systemctl is-active`.
 - **The GPU is the signal that matters.** A model generating pins it near 100% while
   barely moving the CPU, so a CPU-only trigger would miss exactly the case worth showing.
   Heavy CPU work counts as working too, at 35% of all cores.
-- **Asymmetric timing.** Red is immediate; blue waits for `IDLE_HOLD` (20s) of quiet, so
-  the gaps between tokens in a response do not strobe the case.
+- **Asymmetric timing.** Red is immediate; the idle colour waits for `IDLE_HOLD` (20s)
+  of quiet, so the gaps between tokens in a response do not strobe the case.
 - **It only writes on a transition**, comparing against the same state file `rgb-apply`
   records, so OpenRGB is not sent the same colour every few seconds.
 - Thresholds are environment variables with defaults — `GPU_BUSY`, `CPU_BUSY`,

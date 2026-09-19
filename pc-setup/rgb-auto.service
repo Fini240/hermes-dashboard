@@ -1,5 +1,5 @@
 [Unit]
-Description=RGB lighting follows machine load (red working, blue idle)
+Description=RGB lighting follows machine load (red working, green idle)
 After=openrgb.service
 Wants=openrgb.service
 

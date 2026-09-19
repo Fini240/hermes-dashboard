@@ -1,6 +1,6 @@
 #!/bin/sh
 # Drive the RGB lighting from what the machine is actually doing: red while it
-# is working, blue while it is idle. Enabled and disabled as a systemd service
+# is working, green while it is idle. Enabled and disabled as a systemd service
 # by the dashboard toggle, so it keeps running with no dashboard attached and
 # comes back by itself after a reboot.
 #
@@ -10,11 +10,11 @@
 # editing this file — and so the idle branch can be exercised on a busy box.
 : "${GPU_BUSY:=20}"    # percent; the same threshold the ollama sleep guard uses
 : "${CPU_BUSY:=35}"    # percent across all cores
-: "${IDLE_HOLD:=20}"   # seconds of quiet before falling back to blue
+: "${IDLE_HOLD:=20}"   # seconds of quiet before falling back to the idle colour
 : "${POLL:=3}"
 : "${STATE:=/var/lib/hermes-rgb/state}"
 : "${BUSY_COLOR:=red}"
-: "${IDLE_COLOR:=blue}"
+: "${IDLE_COLOR:=green}"
 
 gpu_pct() {
   for f in /sys/class/drm/card*/device/gpu_busy_percent; do

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Apply a lighting preset to every RGB controller in this PC and remember it.
-#   rgb-apply red|purple|blue|off
+#   rgb-apply red|purple|blue|green|off
 # Talks to the running openrgb --server: a bare `openrgb` invocation re-detects
 # every controller first and takes ~22s, while the client path is under a second.
 STATE=/var/lib/hermes-rgb/state
@@ -9,8 +9,9 @@ case "$1" in
   red)    COL=FF0000 ;;
   purple) COL=8000FF ;;
   blue)   COL=0000FF ;;
+  green)  COL=00FF00 ;;
   off)    COL= ;;
-  *) echo "usage: rgb-apply red|purple|blue|off" >&2; exit 2 ;;
+  *) echo "usage: rgb-apply red|purple|blue|green|off" >&2; exit 2 ;;
 esac
 
 if [ -z "$COL" ]; then

@@ -363,7 +363,7 @@ def display_action(action):
         return False, str(e)[:160]
 
 
-RGB_COLORS = ("red", "purple", "blue", "off")
+RGB_COLORS = ("red", "purple", "blue", "green", "off")
 
 
 def rgb_action(color):
@@ -412,7 +412,7 @@ def rgb_auto_action(on):
                            capture_output=True, text=True, timeout=30)
         if r.returncode == 0 and "queued" in r.stdout:
             return True, ("lighting now follows the load — red while working, "
-                          "blue when idle" if on else
+                          "green when idle" if on else
                           "automatic lighting off — the colour stays where it is")
         err = (r.stderr or r.stdout or "command failed").strip().splitlines()
         return False, (err[-1] if err else "command failed")[:160]
@@ -899,6 +899,7 @@ button.pw .sw.on{opacity:1;box-shadow:0 0 0 3px rgba(255,255,255,.14)}
 button.pw .sw[data-c=red]{background:#ff2d2d}
 button.pw .sw[data-c=purple]{background:#8000ff}
 button.pw .sw[data-c=blue]{background:#2d6bff}
+button.pw .sw[data-c=green]{background:#2ddd6b}
 button.pw .sw:last-of-type{margin-right:9px}
 /* A toggle, not a command: narrower than the action buttons beside it, and it
    carries its own on/off state rather than arming and firing. */
@@ -1062,7 +1063,7 @@ async function tick(){
       // itself — anywhere beside a swatch — turns the lighting off. The swatch
       // handlers stop propagation so they do not also fire that.
       '<button class="pw rgb" id="rgbbtn" onclick="doRgb(\'off\')">'+
-      ['red','purple','blue'].map(c=>
+      ['red','purple','blue','green'].map(c=>
         '<span class="sw" data-c="'+c+'" onclick="event.stopPropagation();doRgb(\''+c+'\')"></span>'
       ).join('')+
       '<span>RGB</span></button>'+
@@ -1074,7 +1075,7 @@ async function tick(){
       'PC stays awake and online, and a key press at the desk lights them again. '+
       'On the RGB button a swatch sets that colour — clicking the button beside the '+
       'swatches switches the lighting off. Auto hands the lighting to the PC itself: '+
-      'red while it is working, blue while it is idle. Picking a colour by hand turns '+
+      'red while it is working, green while it is idle. Picking a colour by hand turns '+
       'Auto back off.</div></div>');
     if(p.top&&p.top.length)
       B.push('<div class="card"><div class="label">Top processes · up '+dur(p.uptime)+'</div>'+
@@ -1267,7 +1268,7 @@ function syncRgbAuto(s){
   t.textContent=a?'Auto on':'Auto';
   b.dataset.on=a?'1':'0';
   b.title=a?'The PC is colouring itself by load — click to stop'
-           :'Let the PC colour itself: red while working, blue while idle';
+           :'Let the PC colour itself: red while working, green while idle';
 }
 async function doRgbAuto(){
   const b=document.getElementById('autobtn'), msg=document.getElementById('pwmsg');
