@@ -1,13 +1,31 @@
 #!/bin/sh
-# Re-apply the last preset set from the dashboard. Run after the server starts
-# and after resume, because the lights fall back to the board firmware default
-# across a power cycle and the server loses its device handles across S3.
-s=$(cat /var/lib/hermes-rgb/state 2>/dev/null)
-[ -n "$s" ] || exit 0
+# Bring the lighting back to what was last set from the dashboard. Runs after
+# the OpenRGB server starts and after resume, because the lights fall back to
+# the board firmware default across a power cycle and the server loses its
+# device handles across S3.
+CLIENT="openrgb --client 127.0.0.1:6742"
+STATE=/var/lib/hermes-rgb/state
+
 # Server startup detection takes ~20s, so wait for it rather than racing it.
 i=0
 while [ $i -lt 40 ]; do
-  openrgb --client 127.0.0.1:6742 --list-devices >/dev/null 2>&1 && break
+  $CLIENT --list-devices >/dev/null 2>&1 && break
   i=$((i+1)); sleep 2
 done
+
+# Corsair channel zones come up sized to ZERO leds, and a zone with no leds
+# swallows every colour write in silence — which is exactly why the fans stayed
+# dark while the DRAM obeyed. Nothing reports how many leds are physically on
+# the chain, so both headers are addressed at their full length: whatever is
+# plugged in then falls inside the range, and the rest simply is not there.
+idx=$($CLIENT --list-devices 2>/dev/null | grep -m1 "Corsair Lighting Node" | cut -d: -f1)
+if [ -n "$idx" ] && ! $CLIENT --list-detailed 2>/dev/null | grep -q "Corsair RGB Header 1, LED 204"; then
+  # --size is rejected unless a mode/colour comes with it in the same call.
+  for z in 0 1; do
+    $CLIENT --device "$idx" --zone "$z" --size 204 --mode direct --color 000000 >/dev/null 2>&1
+  done
+fi
+
+s=$(cat "$STATE" 2>/dev/null)
+[ -n "$s" ] || exit 0
 exec /usr/local/bin/rgb-apply "$s"

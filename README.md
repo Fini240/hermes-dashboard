@@ -156,6 +156,16 @@ Why it is built that way:
   survives a reboot (the board would otherwise return to its firmware effect) and a
   resume (the server loses its SMBus and hidraw handles across S3). A value the
   dashboard merely remembered would go stale in exactly those two cases.
+- **Corsair channel zones arrive sized to zero LEDs**, and a zone with no LEDs swallows
+  every colour write in silence. That is the failure this cost a session to find: the
+  DRAM obeyed immediately while the fans on a Lighting Node Core stayed dark, with no
+  error anywhere. `rgb-restore` sizes both headers to their full length before applying
+  anything, so a fresh config, a rebuilt container or a new machine cannot reintroduce
+  it. Nothing reports how many LEDs are physically on the chain, so addressing the full
+  length is the honest default: whatever is plugged in falls inside the range.
+- **`--size` is rejected unless a mode or colour is passed in the same invocation** —
+  on its own it fails with the unhelpful `Device 0 specified, but neither mode nor
+  color given`.
 - **Caveat:** if the lighting is changed by something else — the BIOS, or Windows on
   the other boot — that file is no longer the truth. It is what this machine last
   applied, not a read-back.
