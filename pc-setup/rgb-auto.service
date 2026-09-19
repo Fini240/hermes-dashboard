@@ -1,0 +1,13 @@
+[Unit]
+Description=RGB lighting follows machine load (red working, blue idle)
+After=openrgb.service
+Wants=openrgb.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rgb-auto
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

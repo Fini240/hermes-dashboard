@@ -1,0 +1,70 @@
+#!/bin/sh
+# Drive the RGB lighting from what the machine is actually doing: red while it
+# is working, blue while it is idle. Enabled and disabled as a systemd service
+# by the dashboard toggle, so it keeps running with no dashboard attached and
+# comes back by itself after a reboot.
+#
+# The GPU is the signal that matters — a model generating pins it near 100%
+# while barely troubling the CPU — but heavy CPU work counts as working too.
+# Tunable from the environment so a systemd drop-in can change them without
+# editing this file — and so the idle branch can be exercised on a busy box.
+: "${GPU_BUSY:=20}"    # percent; the same threshold the ollama sleep guard uses
+: "${CPU_BUSY:=35}"    # percent across all cores
+: "${IDLE_HOLD:=20}"   # seconds of quiet before falling back to blue
+: "${POLL:=3}"
+: "${STATE:=/var/lib/hermes-rgb/state}"
+: "${BUSY_COLOR:=red}"
+: "${IDLE_COLOR:=blue}"
+
+gpu_pct() {
+  for f in /sys/class/drm/card*/device/gpu_busy_percent; do
+    if [ -f "$f" ]; then cat "$f" 2>/dev/null; return; fi
+  done
+  echo 0
+}
+
+# /proc/stat is cumulative, so utilisation is the delta between two reads. The
+# figures are carried in variables rather than returned from a function: a
+# command substitution runs in a subshell, so a counter updated inside one
+# would be thrown away on every iteration.
+read_cpu() {
+  set -- $(awk '/^cpu /{idle=$5+$6; tot=0; for(n=2;n<=NF;n++) tot+=$n; print tot, idle; exit}' /proc/stat)
+  CPU_T=$1
+  CPU_I=$2
+}
+
+read_cpu
+prev_t=$CPU_T
+prev_i=$CPU_I
+last_busy=0
+
+while :; do
+  sleep "$POLL"
+
+  read_cpu
+  dt=$((CPU_T - prev_t))
+  di=$((CPU_I - prev_i))
+  prev_t=$CPU_T
+  prev_i=$CPU_I
+  cpu=0
+  [ "$dt" -gt 0 ] && cpu=$(( (100 * (dt - di)) / dt ))
+
+  gpu=$(gpu_pct)
+  case "$gpu" in ''|*[!0-9]*) gpu=0 ;; esac
+
+  now=$(date +%s)
+  if [ "$gpu" -ge "$GPU_BUSY" ] || [ "$cpu" -ge "$CPU_BUSY" ]; then
+    last_busy=$now
+    want=$BUSY_COLOR
+  elif [ $((now - last_busy)) -ge "$IDLE_HOLD" ]; then
+    want=$IDLE_COLOR
+  else
+    want=                        # inside the hold window: leave the lights be
+  fi
+
+  # Compare against what was actually applied, so OpenRGB is only touched on a
+  # real transition instead of being sent the same colour every few seconds.
+  if [ -n "$want" ] && [ "$want" != "$(cat "$STATE" 2>/dev/null)" ]; then
+    /usr/local/bin/rgb-apply "$want" >/dev/null 2>&1
+  fi
+done

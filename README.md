@@ -1,8 +1,8 @@
 # hermes-dashboard
 
 A single-file browser dashboard for a remote Ollama box: live GPU/CPU/RAM/power,
-wake-on-LAN, suspend/shutdown, monitor blanking, RGB lighting, and Hermes token
-accounting. Stdlib-only Python — no pip install, no build step, no JS framework.
+wake-on-LAN, suspend/shutdown, monitor blanking, RGB lighting that can follow the
+machine's own load, and Hermes token accounting. Stdlib-only Python — no pip install, no build step, no JS framework.
 
 Runs anywhere with Docker — a NAS, a mini PC, a Raspberry Pi — as long as it shares
 the monitored machine's LAN.
@@ -32,6 +32,7 @@ browser ──GET /──────────► PAGE_HTML   (static, placeh
         ──POST /api/wake─► magic packet, direct or relayed
         ──POST /api/display► ssh <PC> kscreen-doctor --dpms on|off
         ──POST /api/rgb────► ssh <PC> rgb-apply red|purple|blue|off
+        ──POST /api/rgbauto► ssh <PC> systemctl …able --now rgb-auto
                               ▲
    poller thread (2s) ────────┤  ssh <PC> sysfs probe  → GPU/CPU/RAM/power
                               │  GET /api/ps           → resident models
@@ -129,7 +130,9 @@ Everything hardware-facing lives on the PC, in `pc-setup/`:
 | File | Goes to | |
 |---|---|---|
 | `rgb-apply` | `/usr/local/bin/` | Applies a preset and records it |
-| `rgb-restore` | `/usr/local/bin/` | Re-applies the recorded preset |
+| `rgb-restore` | `/usr/local/bin/` | Sizes the zones, re-applies the preset |
+| `rgb-auto` | `/usr/local/bin/` | Loop: red while working, blue while idle |
+| `rgb-auto.service` | `/etc/systemd/system/` | The Auto toggle enables/disables this |
 | `openrgb.service` | `/etc/systemd/system/` | OpenRGB in server mode |
 | `openrgb-resume.service` | `/etc/systemd/system/` | Restarts it after resume |
 
@@ -139,6 +142,29 @@ install -m755 pc-setup/rgb-* /usr/local/bin/
 cp pc-setup/openrgb*.service /etc/systemd/system/
 systemctl enable --now openrgb.service openrgb-resume.service
 ```
+
+### The Auto toggle
+
+Next to the swatches, `Auto` hands the lighting to the PC: **red while it is working,
+blue while it is idle**. Picking a colour by hand switches Auto back off — leaving both
+on would mean the daemon quietly reverting the choice at the next load transition, which
+reads as a broken button.
+
+The loop runs **on the PC**, as `rgb-auto.service`, not in the dashboard's poller. That
+is deliberate: rebuilding the container or rebooting the dashboard host must not freeze
+the lighting, and `systemctl enable` makes the mode survive a reboot of the PC itself.
+The dashboard only flips the switch and reports `systemctl is-active`.
+
+- **The GPU is the signal that matters.** A model generating pins it near 100% while
+  barely moving the CPU, so a CPU-only trigger would miss exactly the case worth showing.
+  Heavy CPU work counts as working too, at 35% of all cores.
+- **Asymmetric timing.** Red is immediate; blue waits for `IDLE_HOLD` (20s) of quiet, so
+  the gaps between tokens in a response do not strobe the case.
+- **It only writes on a transition**, comparing against the same state file `rgb-apply`
+  records, so OpenRGB is not sent the same colour every few seconds.
+- Thresholds are environment variables with defaults — `GPU_BUSY`, `CPU_BUSY`,
+  `IDLE_HOLD`, `POLL`, `BUSY_COLOR`, `IDLE_COLOR` — so a systemd drop-in can retune it
+  without editing the script.
 
 Why it is built that way:
 

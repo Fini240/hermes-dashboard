@@ -133,6 +133,7 @@ echo "mon_off=$_mon_off"
 # lights doing", not a guess the dashboard keeps to itself.
 echo "rgb=$(cat /var/lib/hermes-rgb/state 2>/dev/null)"
 [ -x /usr/local/bin/rgb-apply ] && echo "rgb_avail=1" || echo "rgb_avail=0"
+echo "rgb_auto=$(systemctl is-active rgb-auto 2>/dev/null)"
 # True generation speed straight from Ollama's own llama-server timings, which
 # it logs to the system journal (identifier "ollama"). This is the real tok/s of
 # the last completed response for ANY client, not just Hermes traffic, and it
@@ -379,11 +380,40 @@ def rgb_action(color):
     if pc_os() == "windows":
         return False, "RGB control is Linux-only — OpenRGB is set up on the Linux side"
     try:
+        # Picking a colour by hand ends the automatic mode. Leaving both on
+        # would mean the daemon silently reverting the choice at the next load
+        # transition, which reads as the button not working.
         r = subprocess.run(["ssh", *SSH_OPTS, "root@" + HOST,
+                            "systemctl disable --now rgb-auto >/dev/null 2>&1; "
                             "/usr/local/bin/rgb-apply " + color],
                            capture_output=True, text=True, timeout=30)
         if r.returncode == 0 and "ok" in r.stdout:
             return True, ("lights off" if color == "off" else "lights set to " + color)
+        err = (r.stderr or r.stdout or "command failed").strip().splitlines()
+        return False, (err[-1] if err else "command failed")[:160]
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, str(e)[:160]
+
+
+def rgb_auto_action(on):
+    """Enable or disable the PC's load-following lighting daemon.
+
+    The loop lives on the PC rather than in this poller so that it keeps
+    working with no dashboard attached — a container rebuild or a zimaos reboot
+    must not leave the lighting frozen — and `enable` makes it survive a reboot
+    of the PC too. The dashboard only flips the switch and reports its state.
+    """
+    if pc_os() == "windows":
+        return False, "automatic lighting is Linux-only"
+    cmd = ("systemctl enable --now rgb-auto" if on
+           else "systemctl disable --now rgb-auto")
+    try:
+        r = subprocess.run(["ssh", *SSH_OPTS, "root@" + HOST, cmd + " && echo queued"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0 and "queued" in r.stdout:
+            return True, ("lighting now follows the load — red while working, "
+                          "blue when idle" if on else
+                          "automatic lighting off — the colour stays where it is")
         err = (r.stderr or r.stdout or "command failed").strip().splitlines()
         return False, (err[-1] if err else "command failed")[:160]
     except (subprocess.TimeoutExpired, OSError) as e:
@@ -697,6 +727,8 @@ def poller():
                 # booted into Windows, or OpenRGB not set up on it.
                 "rgb": ((pc.get("rgb") or None)
                         if pc and pc.get("rgb_avail") == "1" else None),
+                "rgb_auto": ((pc.get("rgb_auto") == "active")
+                             if pc and pc.get("rgb_avail") == "1" else None),
                 # ssh reachable, so GPU/CPU/RAM figures are available.
                 "host_stats": pc is not None,
                 "rate": rate,
@@ -868,6 +900,10 @@ button.pw .sw[data-c=red]{background:#ff2d2d}
 button.pw .sw[data-c=purple]{background:#8000ff}
 button.pw .sw[data-c=blue]{background:#2d6bff}
 button.pw .sw:last-of-type{margin-right:9px}
+/* A toggle, not a command: narrower than the action buttons beside it, and it
+   carries its own on/off state rather than arming and firing. */
+button.pw.mini{min-width:0;padding:9px 13px}
+button.pw.mini.on{color:var(--fg);border-color:var(--grn)}
 footer{color:var(--faint);font-size:12px;margin-top:30px;text-align:center}
 </style></head><body><div class="wrap">
 <header><h1>__PC_NAME__</h1><span class="pill" id="status"><i class="dot"></i>connecting</span></header>
@@ -1030,12 +1066,16 @@ async function tick(){
         '<span class="sw" data-c="'+c+'" onclick="event.stopPropagation();doRgb(\''+c+'\')"></span>'
       ).join('')+
       '<span>RGB</span></button>'+
+      '<button class="pw mini" id="autobtn" onclick="doRgbAuto()">'+
+      '<i class="dot dim"></i><span>Auto</span></button>'+
       '</div><div class="note" id="pwmsg">Suspend keeps the network card armed, so Wake '+
       'can bring it back. Shut down cuts power to the card — it will not wake until '+
       'wake-on-LAN is enabled in the BIOS. Monitors off blanks the displays only — the '+
       'PC stays awake and online, and a key press at the desk lights them again. '+
       'On the RGB button a swatch sets that colour — clicking the button beside the '+
-      'swatches switches the lighting off.</div></div>');
+      'swatches switches the lighting off. Auto hands the lighting to the PC itself: '+
+      'red while it is working, blue while it is idle. Picking a colour by hand turns '+
+      'Auto back off.</div></div>');
     if(p.top&&p.top.length)
       B.push('<div class="card"><div class="label">Top processes · up '+dur(p.uptime)+'</div>'+
         p.top.map(t=>{const q=t.trim().split(/\s+/);
@@ -1132,6 +1172,7 @@ async function tick(){
   // monitors indicator is updated by hand instead, after the card exists.
   syncMonitors(s);
   syncRgb(s);
+  syncRgbAuto(s);
   document.getElementById('sub').textContent='__PC_HOST__ · over Tailscale · updated '+
     new Date(s.ts*1000).toLocaleTimeString();
 }
@@ -1213,6 +1254,34 @@ function syncRgb(s){
   b.querySelectorAll('.sw').forEach(w=>
     w.classList.toggle('on',w.dataset.c===c));
 }
+function syncRgbAuto(s){
+  const b=document.getElementById('autobtn'); if(!b||b._busy) return;
+  const d=b.querySelector('i'), t=b.querySelector('span'), a=s.rgb_auto;
+  if(a==null){
+    b.disabled=true; b.classList.remove('on'); d.className='dot dim';
+    t.textContent='Auto n/a'; b.title='Needs the RGB setup on the PC.'; return;
+  }
+  b.disabled=false;
+  b.classList.toggle('on',a);
+  d.className=a?'dot':'dot dim';
+  t.textContent=a?'Auto on':'Auto';
+  b.dataset.on=a?'1':'0';
+  b.title=a?'The PC is colouring itself by load — click to stop'
+           :'Let the PC colour itself: red while working, blue while idle';
+}
+async function doRgbAuto(){
+  const b=document.getElementById('autobtn'), msg=document.getElementById('pwmsg');
+  if(b.disabled) return;
+  const want=b.dataset.on!=='1';
+  b._busy=true; b.querySelector('span').textContent=want?'Starting…':'Stopping…';
+  try{
+    const r=await(await fetch('/api/rgbauto',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({on:want})})).json();
+    if(msg)msg.textContent=r.message;
+  }catch(e){ if(msg)msg.textContent='Could not reach the dashboard server.'; }
+  setTimeout(()=>{b._busy=false;},4000);
+}
 async function doRgb(color){
   const b=document.getElementById('rgbbtn'), msg=document.getElementById('pwmsg');
   if(b.disabled) return;
@@ -1282,6 +1351,13 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 action = ""
             ok, msg = display_action(action)
+        elif self.path.startswith("/api/rgbauto"):
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                on = bool(json.loads(self.rfile.read(n) or b"{}").get("on"))
+            except ValueError:
+                on = False
+            ok, msg = rgb_auto_action(on)
         elif self.path.startswith("/api/rgb"):
             n = int(self.headers.get("Content-Length") or 0)
             try:
