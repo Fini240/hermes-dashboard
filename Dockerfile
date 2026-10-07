@@ -6,6 +6,7 @@ RUN apk add --no-cache openssh-client
 
 WORKDIR /app
 COPY hermes-dashboard-server.py /app/hermes-dashboard-server.py
+COPY ui /app/ui
 
 # Unbuffered so `docker logs` shows the startup banner and any traceback
 # immediately instead of holding them in a pipe buffer.

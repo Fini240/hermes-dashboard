@@ -97,6 +97,7 @@ for c in /sys/class/drm/card*/device; do
   for h in $c/hwmon/hwmon*/; do
     echo "gpu_temp=$(cat ${h}temp1_input 2>/dev/null)"
     echo "gpu_power=$(cat ${h}power1_average 2>/dev/null)"
+    echo "gpu_power_cap=$(cat ${h}power1_cap 2>/dev/null)"
     echo "gpu_fan=$(cat ${h}fan1_input 2>/dev/null)"
   done
   break
@@ -496,6 +497,28 @@ def power_action(action):
 
 
 _snapshot = {"ok": False, "error": "starting up"}
+# Sparkline history for the page's Monitor while Strata is not the one answering
+# (Strata keeps its own). Same series names as Strata's /metrics "history".
+_HIST_KEYS = ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "cpu", "tok_s", "disk_read_mb",
+              "gpu_pcie_rx_mb", "prefill_tok_s_mean")
+_hist = {k: [] for k in _HIST_KEYS}
+_hist_lock = threading.Lock()
+_agent = {"ok": None, "at": 0.0}
+
+
+def probe_agent():
+    """Is the Hermes agent's API server answering? Checked every 15 s at most."""
+    if not os.environ.get("HERMES_AGENT_URL"):
+        return None
+    if time.time() - _agent["at"] < 15:
+        return _agent["ok"]
+    _agent["at"] = time.time()
+    try:
+        with urllib.request.urlopen(os.environ["HERMES_AGENT_URL"].rstrip("/") + "/health", timeout=4) as r:
+            _agent["ok"] = r.status == 200
+    except Exception:
+        _agent["ok"] = False
+    return _agent["ok"]
 _lock = threading.Lock()
 
 
@@ -792,8 +815,7 @@ def poller():
                 engine = {"active": "ollama", "state": "ready"}
             else:
                 engine = {"active": None, "state": "none"}
-        strata = (probe_strata() if engine and engine["active"] == "strata"
-                  and engine["state"] != "loading" else None)
+        strata = None     # the page reads Strata's /metrics itself, through this server
         if strata and engine["state"] == "generating" and strata["live"].get("tok_s"):
             # /metrics' rate is the same window Strata's own page shows.
             gen_rate, gen_age = strata["live"]["tok_s"], 0.0
@@ -852,6 +874,7 @@ def poller():
                 "vram_used": int(pc.get("vram_used", 0) or 0), "vram_total": vt,
                 "temp": int(pc.get("gpu_temp", 0) or 0) / 1000,
                 "power": int(pc.get("gpu_power", 0) or 0) / 1e6,
+                "power_cap": int(pc.get("gpu_power_cap", 0) or 0) / 1e6 or None,
                 "fan": int(pc.get("gpu_fan", 0) or 0),
                 "mem_used": (mt - ma) * 1024, "mem_total": mt * 1024,
                 "load": float(pc.get("load", 0) or 0),
@@ -892,701 +915,296 @@ def poller():
                     "idle": time.time() - (ls or 0),
                 }
 
+        snap["agent"] = probe_agent()
+        if "pc" in snap:
+            p = snap["pc"]
+            sample = {"gpu_util": p["busy"], "gpu_mem_used": p["vram_used"], "gpu_temp": p["temp"],
+                      "gpu_power": p["power"], "cpu": p["cpu_pct"], "tok_s": gen_rate if gen_rate and gen_age == 0 else
+                      (gen_rate if gen_rate and gen_age is not None and gen_age < 5 else 0)}
+            with _hist_lock:
+                for k in _HIST_KEYS:
+                    _hist[k].append(sample.get(k))
+                    del _hist[k][:-120]
         with _lock:
             _snapshot.clear()
             _snapshot.update(snap)
         time.sleep(max(0.2, POLL_SECONDS - (time.time() - t0)))
 
 
-PAGE = r"""<!doctype html>
-<html lang="en" data-theme="dark"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>__PC_NAME__</title>
-<!-- Activity trace, recoloured live by setFav(): green healthy, amber when
-     host metrics are missing, red when the PC is unreachable. The tab strip
-     then works as a status light without opening the page. -->
-<link id="fav" rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2032%2032%22%3E%3Crect%20width%3D%2232%22%20height%3D%2232%22%20rx%3D%227%22%20fill%3D%22%230d1117%22%2F%3E%3Cpath%20d%3D%22M3%2020h5.5l3-9.5%204%2016%203-8H29%22%20fill%3D%22none%22%20stroke%3D%22%2334d399%22%20stroke-width%3D%223.4%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%2F%3E%3C%2Fsvg%3E">
-<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;700;900&display=swap" rel="stylesheet">
-<style>
-/* Design tokens follow Strata's own web UI (serve/web/tokens.css, MIT), so the
-   dashboard and Strata's page read as one product. Dark is the default; the
-   header toggle switches to light and remembers it in this browser. */
-:root{
-  --font:"Outfit",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-  --mono:ui-monospace,"SF Mono","Cascadia Code",Consolas,monospace;
-  --r-sm:8px;--r-md:14px;--r-lg:20px;--r-pill:9999px;
-  --bg:#f9fafb;--surface:#fff;--surface-2:#f7f7f7;--line:#dee5ee;--line-soft:#eeeeee;
-  --ink:#221e1f;--ink-soft:#303030;--muted:#6f6f6f;
-  --accent:#10b981;--accent-ink:#fff;--accent-tint:#ecfdf5;--accent-text:#0c8a60;
-  --info:#0f97ff;--info-tint:#e8f4ff;--info-text:#0668c2;
-  --warn:#e39b0b;--warn-tint:#fff6e0;--warn-text:#8a5a00;
-  --danger:#e0283f;--danger-tint:#fdecee;--danger-text:#b01a2e;
-  --sh-card:0 10px 6px rgba(0,0,0,.02),0 4px 4px rgba(0,0,0,.03),0 1px 2px rgba(0,0,0,.04);
-}
-:root[data-theme="dark"]{
-  --bg:#0e1113;--surface:#161a1d;--surface-2:#1d2226;--line:#2a3036;--line-soft:#22272c;
-  --ink:#eef1f3;--ink-soft:#c7cdd3;--muted:#8e979f;
-  --accent:#34d399;--accent-ink:#052e20;--accent-tint:rgba(52,211,153,.12);--accent-text:#4ade80;
-  --info:#3aa9ff;--info-tint:rgba(58,169,255,.12);--info-text:#7cc4ff;
-  --warn:#f5b53d;--warn-tint:rgba(245,181,61,.12);--warn-text:#f8c96a;
-  --danger:#ff5a6e;--danger-tint:rgba(255,90,110,.12);--danger-text:#ff8a98;
-  --sh-card:0 1px 2px rgba(0,0,0,.4);
-}
-*,*::before,*::after{box-sizing:border-box}
-html,body{margin:0;background:var(--bg);color:var(--ink);font:400 16px/1.55 var(--font);-webkit-font-smoothing:antialiased}
-svg.i{width:18px;height:18px;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+# --- the page ----------------------------------------------------------------
+# The page is Strata's own web UI (MIT, copied into ui/ from the Strata repo) plus
+# a Manage tab (ui/web/manage.js). This server answers the relative paths that
+# page calls — health, metrics, v1/chat/completions, ... — by forwarding them to
+# Strata while it holds the GPU, and by filling them from this dashboard's own
+# probe otherwise. So the one page keeps working when Strata is off, under Ollama,
+# and when the PC sleeps (Manage → Wake), which Strata's page on the PC cannot.
+UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
+UI_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+            ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".woff2": "font/woff2",
+            ".txt": "text/plain; charset=utf-8"}
 
-header{display:flex;align-items:center;gap:16px;height:64px;padding:0 24px;background:var(--surface);border-bottom:1px solid var(--line)}
-.brand{font-weight:900;font-size:19px;letter-spacing:-.01em}
-.host{color:var(--muted);font-size:13px}
-.spacer{flex:1}
-.pill{display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 13px;border-radius:var(--r-pill);border:1px solid var(--line);background:var(--surface-2);font-size:13px;font-weight:500;color:var(--ink-soft);font-variant-numeric:tabular-nums;white-space:nowrap}
-.pill i{width:8px;height:8px;border-radius:50%;background:var(--muted)}
-.pill[data-s=ok] i,.pill[data-s=generating] i{background:var(--accent);box-shadow:0 0 0 4px var(--accent-tint)}
-.pill[data-s=reading] i{background:var(--info);box-shadow:0 0 0 4px var(--info-tint)}
-.pill[data-s=warn] i{background:var(--warn);box-shadow:0 0 0 4px var(--warn-tint)}
-.pill[data-s=off] i{background:var(--danger);box-shadow:0 0 0 4px var(--danger-tint)}
-a.hbtn,button.hbtn{display:inline-flex;align-items:center;gap:8px;height:36px;padding:0 14px;border-radius:10px;border:1px solid var(--line);background:transparent;color:var(--ink-soft);font:500 14px/1 var(--font);text-decoration:none;cursor:pointer}
-a.hbtn:hover,button.hbtn:hover{background:var(--surface-2);color:var(--ink)}
-button.hbtn.icon{width:36px;padding:0;justify-content:center}
 
-main{max-width:1400px;margin:0 auto;padding:24px}
-.grid{display:grid;gap:16px;margin-bottom:16px}
-.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
-.g2{grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}
-.g21{grid-template-columns:minmax(0,1fr) minmax(0,2fr);align-items:start}
-.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--sh-card);padding:20px}
-.ttl{font-weight:700;font-size:17px;margin:0}
-.lbl{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:500;color:var(--muted);margin-bottom:10px}
-.val{font-weight:900;font-size:32px;line-height:1;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
-.unit{font-weight:500;font-size:14px;color:var(--muted);margin-left:4px;letter-spacing:0}
-.meta{color:var(--muted);font-size:13px;margin-top:8px;font-variant-numeric:tabular-nums}
-.two{display:flex;justify-content:space-between;align-items:flex-end;gap:12px}
-.two .r{text-align:right}
-svg.spark{display:block;width:100%;height:40px;margin-top:14px;overflow:visible}
-.bar{height:8px;border-radius:var(--r-pill);background:var(--surface-2);border:1px solid var(--line-soft);overflow:hidden;margin-top:12px}
-.bar>b{display:block;height:100%;border-radius:inherit;background:var(--accent);transition:width .16s ease}
-.bar[data-t=info]>b{background:var(--info)} .bar[data-t=warn]>b{background:var(--warn)} .bar[data-t=danger]>b{background:var(--danger)}
-h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500;margin:32px 0 12px}
-.stale{text-transform:none;letter-spacing:0;font-weight:400}
-.note{color:var(--muted);font-size:13px;line-height:1.5;margin-top:12px}
-.mono{font-family:var(--mono);font-size:13px}
+def ui_file(rel):
+    """(bytes, content type) for a file under ui/, or None. Text gets the page identity."""
+    path = os.path.normpath(os.path.join(UI_DIR, rel))
+    if not path.startswith(UI_DIR + os.sep) or not os.path.isfile(path):
+        return None
+    ext = os.path.splitext(path)[1]
+    with open(path, "rb") as f:
+        body = f.read()
+    if ext in (".html", ".js"):
+        body = body.replace(b"__PC_NAME__", PC_NAME.encode())
+    return body, UI_TYPES.get(ext, "application/octet-stream")
 
-/* model state */
-.state-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.badges{display:flex;gap:6px;flex-wrap:wrap}
-.badge{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:var(--r-pill);font-size:12px;font-weight:700;background:var(--surface-2);color:var(--muted);border:1px solid var(--line);opacity:.55}
-.badge::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
-.badge.on{opacity:1}
-.badge.on[data-b=idle]{color:var(--ink-soft)}
-.badge.on[data-b=reading]{background:var(--info-tint);color:var(--info-text);border-color:transparent}
-.badge.on[data-b=generating]{background:var(--accent-tint);color:var(--accent-text);border-color:transparent}
-.badge.on[data-b=queued],.badge.on[data-b=loading]{background:var(--warn-tint);color:var(--warn-text);border-color:transparent}
-.badge.on[data-b=error]{background:var(--danger-tint);color:var(--danger-text);border-color:transparent}
-.seg{display:inline-flex;gap:4px;padding:4px;background:var(--surface-2);border:1px solid var(--line);border-radius:var(--r-md)}
-.seg button{display:inline-flex;align-items:center;gap:8px;height:36px;padding:0 14px;border:0;border-radius:10px;background:transparent;color:var(--muted);font:500 14px/1 var(--font);cursor:pointer;white-space:nowrap}
-.seg button:hover:not(:disabled){color:var(--ink)}
-.seg button.on{background:var(--surface);color:var(--ink);font-weight:700;box-shadow:var(--sh-card);cursor:default}
-.seg button i{width:8px;height:8px;border-radius:50%;background:var(--muted);opacity:.5}
-.seg button.on i{background:var(--accent);opacity:1;box-shadow:0 0 0 3px var(--accent-tint)}
-.seg button.on i.mix{background:var(--warn);box-shadow:0 0 0 3px var(--warn-tint)}
-.seg button:disabled{opacity:.45;cursor:not-allowed}
-.state-line{display:flex;justify-content:space-between;gap:12px;margin-top:16px;font-size:14px;color:var(--ink-soft);font-variant-numeric:tabular-nums}
-.state-line .r{color:var(--muted)}
 
-/* power + lighting controls */
-.ctl{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-button.pw{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:42px;padding:0 16px;border-radius:var(--r-md);border:1.5px solid var(--line);background:transparent;color:var(--ink);font:700 14px/1 var(--font);cursor:pointer;white-space:nowrap;transition:background .16s}
-button.pw:hover:not(:disabled){background:var(--surface-2)}
-button.pw.armed{background:var(--warn-tint);color:var(--warn-text);border-color:var(--warn)}
-button.pw.danger.armed{background:var(--danger-tint);color:var(--danger-text);border-color:var(--danger)}
-button.pw:disabled{opacity:.45;cursor:not-allowed}
-button.pw .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-tint)}
-button.pw .dot.dim{background:var(--muted);box-shadow:none;opacity:.6}
-button.pw .dot.mix{background:var(--warn);box-shadow:0 0 0 3px var(--warn-tint)}
-button.pw.mini.on{border-color:var(--accent);color:var(--accent-text)}
-/* RGB presets: the swatch IS the control; the rest of the button switches the
-   lights off. Unselected swatches are dimmed so the preset reads at a glance. */
-button.pw .sw{display:inline-block;width:14px;height:14px;border-radius:50%;cursor:pointer;opacity:.4;border:1px solid rgba(255,255,255,.14);transition:opacity .15s,box-shadow .15s}
-button.pw .sw:hover{opacity:.8}
-button.pw .sw.on{opacity:1;box-shadow:0 0 0 3px var(--line)}
-button.pw .sw[data-c=red]{background:#ff2d2d} button.pw .sw[data-c=purple]{background:#8000ff}
-button.pw .sw[data-c=blue]{background:#2d6bff} button.pw .sw[data-c=green]{background:#2ddd6b}
-.msg{font-size:13px;color:var(--ink-soft);margin-top:12px;min-height:20px}
+# The tab icon: the dashboard's activity trace.
+FAVICON_SVG = (b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" '
+               b'fill="#0d1117"/><path d="M3 20h5.5l3-9.5 4 16 3-8H29" fill="none" stroke="#34d399" '
+               b'stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/></svg>')
 
-/* strata details */
-.kv{display:flex;justify-content:space-between;align-items:baseline;font-size:14px;margin-top:16px}
-.kv:first-of-type{margin-top:0}
-.kv .k{color:var(--ink-soft)} .kv .v{color:var(--muted);font-variant-numeric:tabular-nums}
-table{width:100%;border-collapse:collapse;font-size:14px;font-variant-numeric:tabular-nums}
-th{text-align:right;font-weight:500;font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);padding:10px 12px;border-bottom:1px solid var(--line)}
-td{text-align:right;padding:12px;border-bottom:1px solid var(--line-soft);color:var(--ink-soft)}
-th:first-child,td:first-child{text-align:left}
-tr:hover td{background:var(--surface-2)}
-.tbl{overflow-x:auto}
-.st{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:var(--r-pill);font-size:12px;font-weight:700;background:var(--surface-2);color:var(--muted);border:1px solid var(--line)}
-.st::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+# Strata's page talks to these (relative) paths.
+STRATA_PATHS = ("health", "api/health", "metrics", "status", "config", "settings", "mcp",
+                "models", "props", "slots", "load", "unload")
+# Paths that run the model, run tools or change settings: tailnet devices only.
+# The dashboard is also reachable from the home Wi-Fi with no login, and the
+# Hermes agent behind the chat has a terminal on the Mac.
+CONTROL_PATHS = ("v1/", "config", "settings", "load", "unload", "mcp")
 
-/* asleep */
-.asleep{text-align:center;padding:48px 20px}
-.asleep .ttl{font-size:24px;font-weight:900;margin-bottom:6px}
-button.wake{display:inline-flex;align-items:center;gap:8px;height:46px;padding:0 24px;margin-top:20px;border:0;border-radius:var(--r-md);background:var(--accent);color:var(--accent-ink);font:700 15px/1 var(--font);cursor:pointer}
-button.wake:disabled{opacity:.55;cursor:default}
-footer{color:var(--muted);font-size:12px;margin:32px 0 8px;text-align:center}
+# The Hermes agent's OpenAI-compatible API server (gateway platform api_server).
+AGENT_URL = os.environ.get("HERMES_AGENT_URL", "").rstrip("/")
+AGENT_KEY = os.environ.get("HERMES_AGENT_KEY", "")
+# Hermes provider names for the PC's two engines (see ~/.hermes/config.yaml).
+AGENT_PROVIDER_STRATA = os.environ.get("HERMES_AGENT_PROVIDER_STRATA", "custom:strata")
+AGENT_PROVIDER_OLLAMA = os.environ.get("HERMES_AGENT_PROVIDER_OLLAMA", "custom:pc-ollama")
+# The Ollama model a chat gets when none is resident.
+OLLAMA_CHAT_MODEL = os.environ.get("HERMES_OLLAMA_CHAT_MODEL", "qwen3.5:9b")
+# Strata-only request fields other servers would reject or ignore.
+STRATA_ONLY_FIELDS = ("strata_mcp", "experimental_speed_projection")
 
-@media(max-width:1000px){.g4{grid-template-columns:repeat(2,minmax(0,1fr))}.g2,.g21{grid-template-columns:1fr}}
-@media(max-width:560px){header{padding:0 16px;gap:10px}.host,.hbtn .t{display:none}main{padding:16px}.g4{grid-template-columns:1fr}.val{font-size:28px}}
-</style></head><body>
-<header>
-  <span class="brand">__PC_NAME__</span><span class="host" id="sub">__PC_HOST__</span>
-  <span class="spacer"></span>
-  <span class="pill" id="status" data-s="warn"><i></i><span>connecting</span></span>
-  <a class="hbtn" id="chatlink" href="#" target="_blank" rel="noopener" hidden><svg class="i" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="t">Strata chat</span></a>
-  <button class="hbtn icon" id="theme" title="Light / dark" onclick="toggleTheme()"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg></button>
-</header>
-<main><div id="body"></div>
-<footer>refreshes every 2 s</footer></main>
-<script>
-const IC={
-  speed:'<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
-  gpu:'<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2"/>',
-  vram:'<path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/>',
-  temp:'<path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/>',
-  power:'<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/>',
-  cpu:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/>',
-  ram:'<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10v4M10 10v4M14 10v4M18 10v4"/>',
-  plug:'<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>',
-  act:'<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>'};
-const ic=k=>'<svg class="i" viewBox="0 0 24 24">'+IC[k]+'</svg>';
 
-// Theme: dark by default, the choice kept per browser (a convenience only).
-function applyTheme(t){document.documentElement.dataset.theme=t;}
-try{applyTheme(localStorage.getItem('dash-theme')||'dark');}catch(e){}
-function toggleTheme(){const t=document.documentElement.dataset.theme==='dark'?'light':'dark';
-  applyTheme(t);try{localStorage.setItem('dash-theme',t);}catch(e){}}
+def _tailnet(ip):
+    """Tailscale's CGNAT range (100.64.0.0/10) or this host itself."""
+    if ip in ("127.0.0.1", "::1"):
+        return True
+    try:
+        a, b = (int(x) for x in ip.split(".")[:2])
+        return a == 100 and 64 <= b <= 127
+    except ValueError:
+        return False
 
-const FAVICON=c=>'data:image/svg+xml,'+encodeURIComponent(
-  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'+
-  '<rect width="32" height="32" rx="7" fill="#0d1117"/>'+
-  '<path d="M3 20h5.5l3-9.5 4 16 3-8H29" fill="none" stroke="'+c+'" stroke-width="3.4" '+
-  'stroke-linecap="round" stroke-linejoin="round"/></svg>');
-let _fav='';
-// Rewriting the href on every 2s tick makes Chrome re-fetch and flicker,
-// so only touch it when the colour actually changes.
-const setFav=c=>{if(c===_fav)return;_fav=c;
-  const l=document.getElementById('fav');if(l)l.href=FAVICON(c);};
-const H={busy:[],temp:[],rate:[],vram:[],mem:[],cpuw:[],cpup:[],cput:[],totw:[]};
-const MAXH=60;
-const push=(k,v)=>{if(v==null)return;H[k].push(v);if(H[k].length>MAXH)H[k].shift();};
-const gib=b=>(b/1073741824).toFixed(1);
-const num=n=>{n=+n||0;if(n<1000)return String(Math.round(n));
-  const u=['K','M','G','T'];let i=-1;while(n>=1000&&i<3){n/=1000;i++;}
-  return n.toFixed(1)+u[i];};
-const dur=s=>{s=Math.max(0,Math.round(s));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
-  return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m');};
-const tone=p=>p<60?'':(p<85?'warn':'danger');
-const ttone=t=>t<70?'':(t<85?'warn':'danger');
-const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
-// Every series gets a fixed domain so its shape means the same thing on every
-// card and from one minute to the next (percentages 0-100, temperatures 30-95 C,
-// watts 0 to the card's limit). lo/hi omitted = padded auto-range, for tok/s.
-function spark(key,color,lo,hi){
-  const a=H[key];if(a.length<2)return'';
-  let mn,mx;
-  if(lo!=null){mn=lo;mx=hi;}
-  else{const d0=Math.min(...a),d1=Math.max(...a),pad=((d1-d0)||1)*0.15;mn=d0-pad;mx=d1+pad;}
-  const rg=(mx-mn)||1,W=100,Hh=40;
-  const pts=a.map((v,i)=>[(i/(a.length-1))*W,
-    Hh-Math.max(0,Math.min(1,(v-mn)/rg))*(Hh-5)-2]);
-  const d=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(2)+' '+p[1].toFixed(2)).join(' ');
-  const area=d+' L'+W+' '+Hh+' L0 '+Hh+' Z';
-  const id='g'+key;
-  return '<svg class="spark" viewBox="0 0 '+W+' '+Hh+'" preserveAspectRatio="none">'+
-    '<defs><linearGradient id="'+id+'" x1="0" x2="0" y1="0" y2="1">'+
-    '<stop offset="0" stop-color="'+color+'" stop-opacity=".25"/>'+
-    '<stop offset="1" stop-color="'+color+'" stop-opacity="0"/></linearGradient></defs>'+
-    '<path d="'+area+'" fill="url(#'+id+')"/>'+
-    '<path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="1.6" '+
-    'vector-effect="non-scaling-stroke" stroke-linejoin="round"/></svg>';
-}
-const bar=(pct,t)=>'<div class="bar"'+(t?' data-t="'+t+'"':'')+'><b style="width:'+Math.max(0,Math.min(100,pct||0)).toFixed(1)+'%"></b></div>';
-const metric=(icon,label,val,unit,meta,extra)=>
-  '<div class="card"><div class="lbl">'+ic(icon)+label+'</div>'+
-  '<div class="val">'+val+(unit?'<span class="unit">'+unit+'</span>':'')+'</div>'+
-  (meta?'<div class="meta">'+meta+'</div>':'')+(extra||'')+'</div>';
+def _snap():
+    with _lock:
+        return dict(_snapshot)
 
-// Patch the live DOM instead of replacing it: innerHTML on every 2s tick threw
-// away scroll position, text selection, focus and the two-step Shut down
-// confirm. Nodes marked data-keep are rendered once and never touched again.
-function morph(dst,src){
-  const dn=dst.childNodes,sn=src.childNodes;
-  while(dn.length>sn.length)dst.removeChild(dst.lastChild);
-  for(let i=0;i<sn.length;i++){
-    const n=sn[i],o=dn[i];
-    if(!o){dst.appendChild(n.cloneNode(true));continue;}
-    if(o.nodeType!==n.nodeType||o.nodeName!==n.nodeName){
-      dst.replaceChild(n.cloneNode(true),o);continue;}
-    if(n.nodeType===3){if(o.nodeValue!==n.nodeValue)o.nodeValue=n.nodeValue;continue;}
-    if(n.nodeType!==1)continue;
-    if(o.hasAttribute('data-keep'))continue;
-    for(const a of Array.from(n.attributes))
-      if(o.getAttribute(a.name)!==a.value)o.setAttribute(a.name,a.value);
-    for(const a of Array.from(o.attributes))
-      if(!n.hasAttribute(a.name))o.removeAttribute(a.name);
-    morph(o,n);
-  }
-}
 
-const STATES=['idle','reading','generating','queued','error'];
-const PHASE={thinking:'Thinking',answering:'Answering',reading:'Reading the prompt'};
+def strata_up(s=None):
+    s = s or _snap()
+    e = s.get("engine") or {}
+    return bool(STRATA_URL) and e.get("active") == "strata" and e.get("state") != "loading"
 
-function modelCard(s){
-  const e=s.engine, st=s.strata, L=st&&st.live;
-  let state='idle';
-  if(!e) state=null;
-  else if(e.active==='strata') state=e.state==='loading'?'loading':(L&&L.state)||e.state;
-  else if(e.active==='ollama'){
-    const busy=s.pc&&s.pc.busy>40;
-    state=busy?'generating':'idle';
-  }
-  const shown=state==='loading'?['loading','idle','reading','generating','error']:STATES;
-  let h='<div class="card"><div class="state-head"><h3 class="ttl">Model state</h3><div class="badges">'+
-    shown.map(b=>'<span class="badge'+(b===state||(b==='generating'&&state==='answering')?' on':'')+'" data-b="'+b+'">'+
-      b[0].toUpperCase()+b.slice(1)+'</span>').join('')+'</div><span class="spacer"></span>'+
-    // The switch is data-keep: syncEngine() owns its labels, so a click's
-    // "switching…" survives the 2s re-render.
-    '<div class="seg" data-keep>'+
-    '<button class="eng" data-eng="ollama" onclick="doEngine(this)"><i></i><span>Ollama</span></button>'+
-    '<button class="eng" data-eng="strata" onclick="doEngine(this)"><i></i><span>Strata 125B</span></button>'+
-    '</div></div><div class="sl">';
-  if(e&&e.active==='strata'){
-    if(state==='loading'){
-      h+='<div class="state-line"><span>Loading the 125B model into RAM and VRAM</span><span class="r">about 80 s</span></div>'+bar(0,'warn');
-    }else if(L&&(L.state==='generating'||L.state==='reading')){
-      const reading=L.state==='reading';
-      const left=reading?'Reading the prompt':(PHASE[L.phase]||'Generating');
-      const right=reading?(L.prompt_total?num(L.prompt_read)+' / '+num(L.prompt_total)+' tokens':''):
-        (L.generated!=null?L.generated.toLocaleString()+' tokens':'')+(L.tok_s?' · '+L.tok_s.toFixed(1)+' tok/s':'');
-      const pct=reading?(L.prompt_total?L.prompt_read/L.prompt_total*100:0):(L.max_tokens?L.generated/L.max_tokens*100:0);
-      h+='<div class="state-line"><span>'+left+'</span><span class="r">'+right+'</span></div>'+bar(pct,reading?'info':'');
-    }else if(st){
-      h+='<div class="state-line"><span class="mono">'+esc(st.model)+'</span><span class="r">'+
-        (st.requests_total||0)+' requests since start · context '+num(st.max_context)+'</span></div>';
-    }
-  }else if(e&&e.active==='ollama'){
-    const m=s.ollama||[];
-    if(!m.length) h+='<div class="state-line"><span>No model resident</span><span class="r">the next request pays load time</span></div>';
-    else m.forEach(x=>{let left='';
-      if(x.expires){const d=(new Date(x.expires)-new Date())/1000;left=d>0?'unloads in '+dur(d):'expired';}
-      h+='<div class="state-line"><span class="mono">'+esc(x.name)+'</span><span class="r">'+x.params+' · '+x.quant+
-        ' · '+gib(x.vram)+' GiB VRAM · ctx '+num(x.ctx)+(left?' · '+left:'')+'</span></div>';});
-  }else if(e){
-    h+='<div class="state-line"><span>Neither engine is running</span><span class="r">pick one</span></div>';
-  }
-  h+='</div><div class="note" id="engmsg" data-keep>Only one engine runs at a time — both need the whole GPU. Ollama: the '+
-    'everyday models, fastest overall. Strata: the 125B coder, strongest at code (~33 tok/s, about 80 s to load). '+
-    'The PC stops Strata before it suspends and comes back with Ollama.</div></div>';
-  return h;
-}
 
-function strataCards(s){
-  const st=s.strata; if(!st) return '<div class="strata-slot"></div>';
-  const L=st.live||{}, q=(st.requests||[])[0];
-  const ctxUsed=(L.state==='generating'||L.state==='reading')?((L.prompt_tokens||0)+(L.generated||0)):
-    (q?(q.prompt_tokens||0)+(q.output_tokens||0):0);
-  const vt=s.pc?s.pc.vram_total:0, emib=st.experts_mib||0;
-  let h='<div class="strata-slot"><div class="grid g21"><div class="card"><h3 class="ttl" style="margin-bottom:16px">Strata</h3>'+
-    '<div class="kv"><span class="k">Experts in VRAM</span><span class="v">'+(st.experts||0).toLocaleString()+' · '+(emib/1024).toFixed(1)+' GB</span></div>'+
-    bar(vt?emib*1048576/vt*100:0)+
-    '<div class="kv"><span class="k">VRAM hit rate (last answer)</span><span class="v">'+(q&&q.hit_rate!=null?(q.hit_rate*100).toFixed(1)+'%':'—')+'</span></div>'+
-    bar(q&&q.hit_rate!=null?q.hit_rate*100:0,'info')+
-    '<div class="kv"><span class="k">Guesses accepted</span><span class="v">'+(st.accept!=null?(st.accept*100).toFixed(0)+'%':'—')+'</span></div>'+
-    bar(st.accept!=null?st.accept*100:0)+
-    '<div class="kv"><span class="k">Context</span><span class="v">'+num(ctxUsed)+' / '+num(st.max_context)+'</span></div>'+
-    bar(st.max_context?ctxUsed/st.max_context*100:0,'warn')+
-    '<div class="note">Engine '+esc(st.version)+' · the experts that do not fit on the GPU are computed by the CPU.</div></div>';
-  h+='<div class="card"><h3 class="ttl" style="margin-bottom:8px">Recent requests</h3><div class="tbl"><table><tr>'+
-    '<th>Time</th><th>Status</th><th>Prompt</th><th>Reused</th><th>Output</th><th>tok/s</th><th>VRAM hit</th><th>Duration</th></tr>';
-  if(!(st.requests||[]).length) h+='<tr><td colspan="8" style="text-align:center;color:var(--muted)">No requests yet</td></tr>';
-  (st.requests||[]).forEach(r=>{
-    h+='<tr><td>'+new Date(r.time*1000).toLocaleTimeString()+'</td><td style="text-align:left"><span class="st">'+
-      (r.finish==='stop'?'Done':esc(r.finish||'—'))+'</span></td><td>'+num(r.prompt_tokens)+'</td><td>'+num(r.reused)+'</td><td>'+
-      num(r.output_tokens)+'</td><td>'+(r.decode_tok_s!=null?r.decode_tok_s.toFixed(1):'—')+'</td><td>'+
-      (r.hit_rate!=null?(r.hit_rate*100).toFixed(1)+'%':'—')+'</td><td>'+(r.duration_s!=null?r.duration_s.toFixed(1)+' s':'—')+'</td></tr>';});
-  return h+'</table></div></div></div></div>';
-}
+def ollama_model(s):
+    """The resident Ollama model, else the configured default."""
+    m = s.get("ollama") or []
+    return m[0]["name"] if m else OLLAMA_CHAT_MODEL
 
-async function tick(){
-  let s;try{s=await(await fetch('/api/stats',{cache:'no-store'})).json();}
-  catch(e){setPill('off','dashboard server gone');setFav('#ff5a6e');return;}
-  setFav(!s.online?'#ff5a6e':(s.host_stats?'#34d399':'#f5b53d'));
-  const B=[];
 
-  // Header pill: what the machine is doing, in Strata's words.
-  const L=s.strata&&s.strata.live;
-  if(!s.online) setPill('off','asleep or off');
-  else if(s.engine&&s.engine.active==='strata'&&s.engine.state==='loading') setPill('warn','Strata loading');
-  else if(L&&L.state==='reading') setPill('reading','Reading prompt');
-  else if(s.gen_rate!=null&&s.gen_age!=null&&s.gen_age<5&&s.pc&&s.pc.busy>40) setPill('generating','Generating · '+s.gen_rate.toFixed(1)+' tok/s');
-  else setPill(s.host_stats?'ok':'warn',s.host_stats?'online':'online · no host metrics');
-  const cl=document.getElementById('chatlink');
-  const strataUp=s.strata_url&&s.engine&&s.engine.active==='strata'&&s.engine.state!=='loading';
-  cl.hidden=!strataUp; if(strataUp) cl.href=s.strata_url+'/';
+def synth_health(s):
+    e = s.get("engine") or {}
+    if not s.get("online"):
+        model = "%s (asleep)" % PC_NAME
+    elif e.get("active") == "strata":
+        model = "Strata (loading)"
+    else:
+        model = ollama_model(s)
+    m = s.get("ollama") or []
+    return {"status": "ok", "model": model, "images": False, "api_key": False, "loaded": bool(s.get("online")),
+            "max_context": (m[0].get("ctx") if m else 0) or 0, "service": "dashboard"}
 
-  if(!s.online){
-    B.push('<div class="card asleep"><div class="ttl">__PC_NAME__ is asleep or off</div>'+
-      '<div class="meta">Neither Ollama nor Strata can answer right now.</div>'+
-      '<button class="wake" onclick="doWake()">'+ic('plug')+'Wake __PC_NAME__</button>'+
-      '<div class="note" id="wakemsg">'+(s.home
-        ? 'You are on the home network — the magic packet goes out directly.'
-        : 'You are away, so the packet is relayed through '+(s.relay||'the relay')+'.')+'</div></div>');
-  }
-  if(s.online&&!s.host_stats){
-    // The model answers, so the machine is up — only the ssh-derived host
-    // metrics are missing. Say exactly that instead of crying "asleep".
-    B.push('<div class="card" style="margin-bottom:16px"><div class="lbl">Host metrics unavailable</div>'+
-      '<div class="note" style="margin-top:0">The PC is up, but the SSH probe is not answering, so GPU, CPU, RAM and '+
-      'power readings and the controls are missing. Tailscale SSH asks for a periodic browser re-auth and hangs until '+
-      'it gets one — run <span class="mono">ssh root@__PC_HOST__</span> once and open the URL it prints.</div></div>');
-  }
-  if(s.host_stats){
-    const p=s.pc;
-    B.push('<div class="grid">'+modelCard(s)+'</div>');
-    const vp=p.vram_used/p.vram_total*100, mp=p.mem_used/p.mem_total*100;
-    push('busy',p.busy);push('temp',p.temp);push('vram',vp);push('mem',mp);
-    push('cpuw',p.cpu_watts);push('cpup',p.cpu_pct);push('cput',p.cpu_temp);push('totw',p.total_watts);
 
-    // Speed: the engine's own live rate (Strata's /metrics or Ollama's journal),
-    // falling back to Hermes' window average, then idle.
-    const g=(s.gen_rate!=null&&s.gen_age!=null), busy=p.busy>40, gFresh=g&&s.gen_age<120;
-    let sv='idle',su='',sm=g?'last answer '+dur(s.gen_age)+' ago':'no recent generation';
-    if(gFresh){sv=s.gen_rate.toFixed(1);su='tok/s';sm=busy?'decode now':'last answer '+dur(s.gen_age)+' ago';}
-    else if(busy){sv='···';sm='busy — waiting for the first token';}
-    else if(s.rate){sv=s.rate.toFixed(1);su='tok/s';sm='Hermes, averaged over '+Math.round(s.window||25)+' s';}
-    push('rate',gFresh&&busy?s.gen_rate:(s.rate||0));
-    const pf=L&&L.prefill_tok_s_mean;
-    const speed='<div class="card"><div class="lbl">'+ic('speed')+'Speed</div><div class="two"><div><div class="val">'+sv+
-      (su?'<span class="unit">'+su+'</span>':'')+'</div><div class="meta">'+sm+'</div></div>'+
-      (pf?'<div class="r"><div class="val">'+Math.round(pf)+'<span class="unit">t/s</span></div><div class="meta">prefill this request</div></div>':'')+
-      '</div>'+spark('rate','#34d399')+'</div>';
-    B.push('<div class="grid g4">'+speed+
-      metric('gpu','GPU load',p.busy.toFixed(0),'%','__GPU_LABEL__',spark('busy','#3aa9ff',0,100))+
-      metric('vram','VRAM',gib(p.vram_used),'/ '+gib(p.vram_total)+' GiB',
-        s.strata?(s.strata.experts||0).toLocaleString()+' experts cached':(s.ollama&&s.ollama.length?s.ollama.length+' model'+(s.ollama.length>1?'s':'')+' resident':'nothing resident'),
-        spark('vram','#a78bfa',0,100))+
-      metric('temp','GPU temp',p.temp.toFixed(0),'°C',p.fan+' rpm · '+p.power.toFixed(0)+' W',spark('temp','#f5b53d',30,95))+
-      '</div>');
-    B.push('<div class="grid g4">'+
-      metric('power','System draw',p.total_watts!=null?p.total_watts.toFixed(0):'—','W',
-        p.cpu_watts!=null?'cpu '+p.cpu_watts.toFixed(0)+' W · gpu '+p.power.toFixed(0)+' W · est.':'',spark('totw','#34d399',0,750))+
-      metric('cpu','CPU',p.cpu_pct!=null?p.cpu_pct.toFixed(0):'—','%',
-        (p.ncpu?p.ncpu+' threads':'')+(p.cpu_freq?' · '+p.cpu_freq.toFixed(2)+' GHz':'')+(p.cpu_watts!=null?' · '+p.cpu_watts.toFixed(0)+' W':''),
-        spark('cpup','#3aa9ff',0,100))+
-      metric('temp','CPU temp',p.cpu_temp?p.cpu_temp.toFixed(0):'—','°C',esc(p.cpu_model||'CPU'),spark('cput','#f5b53d',30,95))+
-      metric('ram','RAM',gib(p.mem_used),'/ '+gib(p.mem_total)+' GiB','load '+p.load.toFixed(2)+' · up '+dur(p.uptime),spark('mem','#a78bfa',0,100))+
-      '</div>');
-
-    B.push(strataCards(s));
-
-    B.push('<div class="grid g2"><div class="card" data-keep><h3 class="ttl" style="margin-bottom:16px">Power &amp; lighting</h3>'+
-      '<div class="ctl">'+
-      '<button class="pw" data-act="suspend" onclick="doPower(this)">Suspend</button>'+
-      '<button class="pw danger" data-act="poweroff" onclick="doPower(this)">Shut down</button>'+
-      // Instantly reversible, so no arm/confirm. Label and dot come from the
-      // live sysfs reading via syncMonitors(), never from what we just sent.
-      '<button class="pw mon" id="monbtn" onclick="doMonitors(this)"><i class="dot dim"></i><span>Monitors</span></button>'+
-      '</div><div class="ctl" style="margin-top:10px">'+
-      // One button, four targets: each swatch sets its colour, the button
-      // itself (beside the swatches) turns the lighting off.
-      '<button class="pw rgb" id="rgbbtn" onclick="doRgb(\'off\')">'+
-      ['red','purple','blue','green'].map(c=>
-        '<span class="sw" data-c="'+c+'" onclick="event.stopPropagation();doRgb(\''+c+'\')"></span>'
-      ).join('')+'<span>RGB</span></button>'+
-      '<button class="pw mini" id="autobtn" onclick="doRgbAuto()"><i class="dot dim"></i><span>Auto</span></button>'+
-      '</div><div class="msg" id="pwmsg"></div>'+
-      '<div class="note">Suspend keeps the network card armed, so Wake brings it back; Shut down needs wake-on-LAN '+
-      'in the BIOS. Monitors off blanks the displays only. A swatch sets that colour, the RGB button beside the '+
-      'swatches switches the lights off. Auto: red while the PC works, green while idle — picking a colour turns it off.</div></div>');
-    let tp='<div class="card"><h3 class="ttl" style="margin-bottom:8px">Top processes</h3><div class="tbl"><table>';
-    (p.top||[]).forEach(t=>{const q=t.trim().split(/\s+/);
-      tp+='<tr><td class="mono">'+esc(q[1]||'?')+'</td><td>'+esc(q[0]||'0')+'%</td></tr>';});
-    B.push(tp+'</table></div></div></div>');
-  }
-
-  const t=s.tokens;
-  if(t){
-    const c=t.current;
-    // On a synced copy the numbers are only as fresh as the last pull from
-    // the Mac, so say so rather than letting them read as live.
-    let age='';
-    if(s.tokens_age!=null&&s.tokens_age>90){
-      const m=Math.round(s.tokens_age/60);
-      age=' <span class="stale">· from the Mac '+(m<60?m+' min':Math.round(m/60)+' h')+' ago</span>';
-    }else if(s.tokens_age==null&&s.tokens_sync_error){
-      age=' <span class="stale">· Mac unreachable</span>';
-    }
-    B.push('<h2>Hermes tokens'+age+'</h2><div class="grid g2">');
-    const kv=(k,v)=>'<div class="kv"><span class="k">'+k+'</span><span class="v">'+v+'</span></div>';
-    if(c) B.push('<div class="card"><h3 class="ttl">Current session</h3><div class="mono" style="color:var(--info-text);margin:4px 0 16px">'+esc(c.id)+'</div>'+
-      kv('Model','<span class="mono">'+esc(c.model)+'</span>')+kv('In / Out',num(c['in'])+' / '+num(c.out))+
-      kv('API calls',c.calls)+kv('Last activity',dur(c.idle)+' ago')+
-      (c.span>=10&&c.out>0?kv('Session average',(c.out/c.span).toFixed(1)+' tok/s'):'')+'</div>');
-    B.push('<div class="card"><h3 class="ttl" style="margin-bottom:16px">All time · '+t.sessions+' sessions</h3>'+
-      kv('Input',num(t['in']))+kv('Output',num(t.out))+kv('Cached',num(t.cache_read))+
-      (t.reasoning?kv('Reasoning',num(t.reasoning)):'')+kv('API calls',t.calls.toLocaleString())+'</div>');
-    B.push('</div>');
-    if(t.models&&t.models.length){
-      let m='<div class="card"><h3 class="ttl" style="margin-bottom:8px">By model</h3><div class="tbl"><table><tr><th>Model</th><th>Calls</th>'+
-            '<th>In</th><th>Out</th><th>Cached</th></tr>';
-      t.models.forEach(x=>{m+='<tr><td class="mono">'+esc(x.name)+'</td><td>'+x.calls+'</td><td>'+
-        num(x['in'])+'</td><td>'+num(x.out)+'</td><td>'+(x.cached?num(x.cached):'—')+'</td></tr>';});
-      B.push(m+'</table></div><div class="note">Local models report no cache statistics, so their cached column stays empty.</div></div>');
-    }
-  }
-  const next=document.createElement('div');next.innerHTML=B.join('');
-  morph(document.getElementById('body'),next);
-  // data-keep parts are never patched by morph(); their live state is set here.
-  syncMonitors(s);
-  syncRgb(s);
-  syncRgbAuto(s);
-  syncEngine(s);
-  document.getElementById('sub').textContent='__PC_HOST__ · updated '+new Date(s.ts*1000).toLocaleTimeString();
-}
-function setPill(state,text){
-  const p=document.getElementById('status');p.dataset.s=state;p.querySelector('span').textContent=text;}
-async function doPower(b){
-  const msg=document.getElementById('pwmsg'), act=b.dataset.act;
-  if(!b.classList.contains('armed')){
-    // [data-act] only: the monitors button is a .pw too.
-    document.querySelectorAll('button.pw[data-act]').forEach(o=>{
-      o.classList.remove('armed');o.textContent=o.dataset.act==='suspend'?'Suspend':'Shut down';});
-    b.classList.add('armed');
-    b.textContent=act==='suspend'?'Confirm suspend':'Confirm shut down';
-    clearTimeout(b._t);
-    b._t=setTimeout(()=>{b.classList.remove('armed');
-      b.textContent=act==='suspend'?'Suspend':'Shut down';},5000);
-    if(msg)msg.textContent='Click again within 5 seconds to confirm.';
-    return;
-  }
-  clearTimeout(b._t);
-  document.querySelectorAll('button.pw[data-act]').forEach(o=>o.disabled=true);
-  b.textContent='Sending…';
-  try{
-    const r=await(await fetch('/api/power',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action:act})})).json();
-    if(msg)msg.textContent=r.message;
-    b.textContent=r.ok?'Sent':'Failed';
-  }catch(e){ if(msg)msg.textContent='Could not reach the dashboard server.'; b.textContent='Failed'; }
-}
-// Live state, straight from the poll: "on" only when the panels really are lit.
-function syncMonitors(s){
-  const b=document.getElementById('monbtn'); if(!b||b._busy) return;
-  const d=b.querySelector('i'), t=b.querySelector('span'), m=s.monitors;
-  b.dataset.state=m||'na';
-  if(!m){
-    b.disabled=true; d.className='dot dim'; t.textContent='Monitors n/a';
-    b.title=s.host_stats?'No display is attached, or the PC is booted into Windows.'
-                        :'Needs the SSH probe, which is not answering.';
-    return;
-  }
-  b.disabled=false;
-  d.className='dot'+(m==='off'?' dim':(m==='mixed'?' mix':''));
-  t.textContent=m==='off'?'Monitors off':(m==='mixed'?'Monitors mixed':'Monitors on');
-  b.title=m==='off'?'Switch the monitors back on'
-                   :'Blank the monitors — the PC stays awake and online';
-}
-async function doMonitors(b){
-  const msg=document.getElementById('pwmsg');
-  const want=b.dataset.state==='off'?'on':'off';
-  b._busy=true; b.disabled=true;
-  b.querySelector('span').textContent=want==='off'?'Turning off…':'Turning on…';
-  try{
-    const r=await(await fetch('/api/display',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action:want})})).json();
-    if(msg)msg.textContent=r.message;
-  }catch(e){ if(msg)msg.textContent='Could not reach the dashboard server.'; }
-  // The next tick reads the real DPMS state and relabels the button from that.
-  setTimeout(()=>{b._busy=false;},2500);
-}
-// What the PC last applied and re-applies itself after a reboot, not a value
-// the page remembers.
-function syncRgb(s){
-  const b=document.getElementById('rgbbtn'); if(!b||b._busy) return;
-  const t=b.querySelector('span:last-of-type'), c=s.rgb;
-  b.dataset.state=c||'na';
-  if(!c){
-    b.disabled=true; t.textContent='RGB n/a';
-    b.title=s.host_stats?'OpenRGB is not set up on this machine, or it is booted into Windows.'
-                        :'Needs the SSH probe, which is not answering.';
-  }else{
-    b.disabled=false;
-    t.textContent=c==='off'?'RGB off':'RGB '+c;
-    b.title='Click a colour to set it · click here to switch the lighting off';
-  }
-  b.querySelectorAll('.sw').forEach(w=>w.classList.toggle('on',w.dataset.c===c));
-}
-function syncRgbAuto(s){
-  const b=document.getElementById('autobtn'); if(!b||b._busy) return;
-  const d=b.querySelector('i'), t=b.querySelector('span'), a=s.rgb_auto;
-  if(a==null){
-    b.disabled=true; b.classList.remove('on'); d.className='dot dim';
-    t.textContent='Auto n/a'; b.title='Needs the RGB setup on the PC.'; return;
-  }
-  b.disabled=false;
-  b.classList.toggle('on',a);
-  d.className=a?'dot':'dot dim';
-  t.textContent=a?'Auto on':'Auto';
-  b.dataset.on=a?'1':'0';
-  b.title=a?'The PC is colouring itself by load — click to stop'
-           :'Let the PC colour itself: red while working, green while idle';
-}
-async function doRgbAuto(){
-  const b=document.getElementById('autobtn'), msg=document.getElementById('pwmsg');
-  if(b.disabled) return;
-  const want=b.dataset.on!=='1';
-  b._busy=true; b.querySelector('span').textContent=want?'Starting…':'Stopping…';
-  try{
-    const r=await(await fetch('/api/rgbauto',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({on:want})})).json();
-    if(msg)msg.textContent=r.message;
-  }catch(e){ if(msg)msg.textContent='Could not reach the dashboard server.'; }
-  setTimeout(()=>{b._busy=false;},4000);
-}
-async function doRgb(color){
-  const b=document.getElementById('rgbbtn'), msg=document.getElementById('pwmsg');
-  if(b.disabled) return;
-  b._busy=true;
-  b.querySelector('span:last-of-type').textContent=color==='off'?'Off…':color+'…';
-  try{
-    const r=await(await fetch('/api/rgb',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({color:color})})).json();
-    if(msg)msg.textContent=r.message;
-  }catch(e){ if(msg)msg.textContent='Could not reach the dashboard server.'; }
-  setTimeout(()=>{b._busy=false;},4000);
-}
-// The lit segment is the engine the PC reports running, not the last click.
-const ENG_STATE={loading:'loading…',idle:'ready',reading:'reading',
-  generating:'generating',ready:'ready',error:'not answering'};
-function syncEngine(s){
-  const bs=document.querySelectorAll('button.eng'); if(!bs.length) return;
-  const e=s.engine;
-  bs.forEach(b=>{
-    if(b._busy) return;
-    const d=b.querySelector('i'), t=b.querySelector('span');
-    const name=b.dataset.eng==='strata'?'Strata 125B':'Ollama';
-    if(!e){
-      b.disabled=true; b.classList.remove('on'); t.textContent=name;
-      b.title=s.host_stats?'llm-engine is not set up on the PC.':'Needs the SSH probe, which is not answering.';
-      return;
-    }
-    const on=e.active===b.dataset.eng;
-    b.disabled=false; b.classList.toggle('on',on);
-    d.className=on&&(e.state==='loading'||e.state==='error')?'mix':'';
-    t.textContent=on?name+' · '+(ENG_STATE[e.state]||e.state):name;
-    b.title=on?'Running now':'Hand the GPU to '+name;
-  });
-}
-async function doEngine(b){
-  const want=b.dataset.eng, msg=document.getElementById('engmsg');
-  if(b.disabled||b.classList.contains('on')) return;
-  const all=document.querySelectorAll('button.eng');
-  all.forEach(o=>{o._busy=true;o.disabled=true;});
-  b.querySelector('span').textContent='Switching…';
-  try{
-    const r=await(await fetch('/api/engine',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({engine:want})})).json();
-    if(msg)msg.textContent=r.message;
-  }catch(e){ if(msg)msg.textContent='Could not reach the dashboard server.'; }
-  // Hand back to the poll, which reads what the PC is really running.
-  setTimeout(()=>{all.forEach(o=>{o._busy=false;});},3000);
-}
-async function doWake(){
-  const b=document.querySelector('button.wake'), m=document.getElementById('wakemsg');
-  if(b){b.disabled=true;b.lastChild.textContent='Sending magic packet…';}
-  try{
-    const r=await(await fetch('/api/wake',{method:'POST'})).json();
-    if(m)m.textContent=r.message;
-    if(b)b.lastChild.textContent=r.ok?'Packet sent — booting takes ~30 s':'Wake failed';
-    if(r.ok&&b)setTimeout(()=>{b.disabled=false;b.lastChild.textContent='Send again';},25000);
-    else if(b)b.disabled=false;
-  }catch(e){
-    if(m)m.textContent='Could not reach the dashboard server.';
-    if(b){b.disabled=false;b.lastChild.textContent='Wake __PC_NAME__';}
-  }
-}
-tick();setInterval(tick,2000);
-</script></body></html>"""
-
-# Substituted once at startup rather than per request — these never change.
-PAGE_HTML = (PAGE.replace("__PC_NAME__", PC_NAME)
-                 .replace("__PC_HOST__", HOST)
-                 .replace("__GPU_LABEL__", GPU_LABEL))
-
+def synth_metrics(s):
+    """Strata's /metrics shape, filled from this dashboard's probe — for Ollama and loading/asleep."""
+    p = s.get("pc") or {}
+    gen = s.get("gen_rate") if (s.get("gen_age") is not None and s["gen_age"] < 5 and p.get("busy", 0) > 40) else None
+    live = {"state": "generating" if gen else "idle", "queued": 0, "tok_s": gen, "phase": None,
+            "prompt_tokens": None, "generated": None, "max_tokens": None, "prefill_tok_s_mean": None}
+    hw = {}
+    if p:
+        hw = {"gpu_util": p.get("busy"), "gpu_mem_used": p.get("vram_used"), "gpu_mem_total": p.get("vram_total"),
+              "gpu_temp": p.get("temp"), "gpu_power": p.get("power"), "gpu_power_limit": p.get("power_cap"),
+              "cpu": p.get("cpu_pct"), "ram_used": p.get("mem_used"), "ram_total": p.get("mem_total"),
+              "tok_s": gen}
+    m = s.get("ollama") or []
+    with _hist_lock:
+        hist = {k: list(v) for k, v in _hist.items()}
+    return {"engine": {"model": synth_health(s)["model"], "max_context": (m[0].get("ctx") if m else 0) or 0},
+            "live": live, "requests": [], "requests_kept": 0, "totals": {}, "conversation_cache": None,
+            "hardware": hw, "history": hist, "time": time.time(),
+            "hardware_static": {"gpu_name": GPU_LABEL, "cpu_name": p.get("cpu_model"),
+                                "threads": p.get("ncpu"), "cores": (p.get("ncpu") or 0) // 2 or None,
+                                "psutil": True}}
 
 
 class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path.startswith("/api/stats"):
-            with _lock:
-                body = json.dumps(_snapshot).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Cache-Control", "no-store")
-        else:
-            body = PAGE_HTML.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def _err(self, code, msg):
+        self._send(code, {"error": {"message": msg, "type": "dashboard"}})
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n) if n else b""
+
+    def _json_field(self, raw, key, default=""):
+        try:
+            return json.loads(raw or b"{}").get(key, default)
+        except ValueError:
+            return default
+
+    def _proxy(self, url, method, body=None, key="", stream=False, timeout=30):
+        """Forward to url; stream=True relays an SSE answer chunk by chunk."""
+        req = urllib.request.Request(url, data=body, method=method)
+        req.add_header("Content-Type", "application/json")
+        if key:
+            req.add_header("Authorization", "Bearer " + key)
+        try:
+            r = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            self._send(e.code, e.read() or b"{}", e.headers.get("Content-Type") or "application/json")
+            return
+        except Exception as e:
+            self._err(502, "upstream not reachable: %s" % str(e)[:120])
+            return
+        with r:
+            if not stream:
+                self._send(r.status, r.read(), r.headers.get("Content-Type") or "application/json")
+                return
+            self.send_response(r.status)
+            self.send_header("Content-Type", r.headers.get("Content-Type") or "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                while True:
+                    chunk = r.read1(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass      # the page pressed Stop: dropping the upstream ends the run there too
+
+    def _chat(self, raw):
+        """POST v1/chat/completions from the page: the model on the PC, or the Hermes agent."""
+        s = _snap()
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            return self._err(400, "bad JSON")
+        for k in STRATA_ONLY_FIELDS:
+            if not strata_up(s):
+                body.pop(k, None)
+        stream = bool(body.get("stream"))
+        e = s.get("engine") or {}
+        if (self.headers.get("X-Chat-Target") or "model") == "agent":
+            if not AGENT_URL:
+                return self._err(503, "The Hermes agent is not configured on this dashboard (HERMES_AGENT_URL).")
+            for k in STRATA_ONLY_FIELDS + ("seed", "top_k"):
+                body.pop(k, None)
+            # The agent thinks with whatever holds the PC's GPU; asleep, with its own default.
+            body.pop("provider", None)
+            body["model"] = "hermes-agent"
+            if s.get("online") and e.get("active") == "strata" and e.get("state") != "loading":
+                body.update(provider=AGENT_PROVIDER_STRATA, model="strata")
+            elif s.get("online") and e.get("active") == "ollama":
+                body.update(provider=AGENT_PROVIDER_OLLAMA, model=ollama_model(s))
+            return self._proxy(AGENT_URL + "/v1/chat/completions", "POST", json.dumps(body).encode(),
+                               AGENT_KEY, stream, timeout=900)
+        if not s.get("online"):
+            return self._err(503, "%s is asleep — wake it under Manage." % PC_NAME)
+        if strata_up(s):
+            return self._proxy(STRATA_URL + "/v1/chat/completions", "POST", json.dumps(body).encode(),
+                               STRATA_KEY, stream, timeout=900)
+        if e.get("active") == "strata":
+            return self._err(503, "Strata is still loading — about 80 s after the switch.")
+        body["model"] = ollama_model(s)
+        return self._proxy(OLLAMA + "/v1/chat/completions", "POST", json.dumps(body).encode(), "", stream, timeout=900)
+
+    def _strata_path(self, method, path, query, raw):
+        s = _snap()
+        if strata_up(s):
+            url = STRATA_URL + "/" + path + (("?" + query) if query else "")
+            return self._proxy(url, method, raw if method == "POST" else None, STRATA_KEY)
+        if path in ("health", "api/health"):
+            return self._send(200, synth_health(s))
+        if path == "metrics":
+            if not s.get("online"):
+                return self._err(503, "%s is asleep" % PC_NAME)
+            return self._send(200, synth_metrics(s))
+        if path == "models":
+            return self._send(200, {"object": "list", "data": [{"id": synth_health(s)["model"], "object": "model"}]})
+        # config / settings / mcp / load / unload are Strata's own: absent while it is off,
+        # which the page already handles (it hides those cards).
+        return self._err(404, "only while Strata runs")
+
+    def do_GET(self):
+        u = urllib.parse.urlsplit(self.path)
+        path = u.path.lstrip("/")
+        if path == "api/stats":
+            with _lock:
+                return self._send(200, json.dumps(_snapshot).encode())
+        if path in ("", "index.html"):
+            f = ui_file("index.html")
+            return self._send(200, f[0], f[1]) if f else self._err(500, "ui/index.html missing")
+        if path == "favicon.ico":
+            return self._send(200, FAVICON_SVG, "image/svg+xml")
+        if path.startswith("fonts/"):      # tokens.css asks for /fonts/..., the files sit in web/fonts
+            path = "web/" + path
+        if path.startswith("web/"):
+            f = ui_file(path)
+            return self._send(200, f[0], f[1]) if f else self._err(404, "not found")
+        if path.startswith(CONTROL_PATHS) and not _tailnet(self.client_address[0]):
+            return self._err(403, "Only from a Tailscale device.")
+        if path in STRATA_PATHS or path.startswith("v1/"):
+            if path == "v1/models":
+                path = "models"
+            return self._strata_path("GET", path, u.query, None)
+        self._err(404, "not found")
+
     def do_POST(self):
-        if self.path.startswith("/api/power"):
-            n = int(self.headers.get("Content-Length") or 0)
-            try:
-                action = json.loads(self.rfile.read(n) or b"{}").get("action", "")
-            except ValueError:
-                action = ""
-            ok, msg = power_action(action)
-        elif self.path.startswith("/api/display"):
-            n = int(self.headers.get("Content-Length") or 0)
-            try:
-                action = json.loads(self.rfile.read(n) or b"{}").get("action", "")
-            except ValueError:
-                action = ""
-            ok, msg = display_action(action)
-        elif self.path.startswith("/api/rgbauto"):
-            n = int(self.headers.get("Content-Length") or 0)
-            try:
-                on = bool(json.loads(self.rfile.read(n) or b"{}").get("on"))
-            except ValueError:
-                on = False
-            ok, msg = rgb_auto_action(on)
-        elif self.path.startswith("/api/rgb"):
-            n = int(self.headers.get("Content-Length") or 0)
-            try:
-                color = json.loads(self.rfile.read(n) or b"{}").get("color", "")
-            except ValueError:
-                color = ""
-            ok, msg = rgb_action(color)
-        elif self.path.startswith("/api/engine"):
-            n = int(self.headers.get("Content-Length") or 0)
-            try:
-                engine = json.loads(self.rfile.read(n) or b"{}").get("engine", "")
-            except ValueError:
-                engine = ""
-            ok, msg = engine_action(engine)
-        elif self.path.startswith("/api/wake"):
+        u = urllib.parse.urlsplit(self.path)
+        path = u.path.lstrip("/")
+        raw = self._body()
+        if path.startswith(CONTROL_PATHS) and not _tailnet(self.client_address[0]):
+            return self._err(403, "Chat and model settings only from a Tailscale device — "
+                                  "the agent behind them can run commands on the Mac.")
+        if path == "v1/chat/completions":
+            return self._chat(raw)
+        if path in STRATA_PATHS or path.startswith("v1/"):
+            return self._strata_path("POST", path, u.query, raw)
+        if path == "api/power":
+            ok, msg = power_action(self._json_field(raw, "action"))
+        elif path == "api/display":
+            ok, msg = display_action(self._json_field(raw, "action"))
+        elif path == "api/rgbauto":
+            ok, msg = rgb_auto_action(bool(self._json_field(raw, "on", False)))
+        elif path == "api/rgb":
+            ok, msg = rgb_action(self._json_field(raw, "color"))
+        elif path == "api/engine":
+            ok, msg = engine_action(self._json_field(raw, "engine"))
+        elif path == "api/wake":
             # direct=1 comes from another dashboard relaying to us: broadcast
             # locally only, never relay onward, so the two can't ping-pong.
-            if "direct=1" in (urllib.parse.urlsplit(self.path).query or ""):
+            if "direct=1" in (u.query or ""):
                 sent = wake_direct()
                 ok = bool(sent)
                 msg = ("magic packet broadcast on the local network" if ok
@@ -1594,14 +1212,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 ok, msg = wake()
         else:
-            self.send_error(404)
-            return
-        body = json.dumps({"ok": ok, "message": msg}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            return self._err(404, "not found")
+        self._send(200, {"ok": ok, "message": msg})
 
     def log_message(self, *a):
         pass  # keep the terminal clean
