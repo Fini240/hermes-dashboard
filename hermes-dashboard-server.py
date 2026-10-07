@@ -952,7 +952,7 @@ def ui_file(rel):
     ext = os.path.splitext(path)[1]
     with open(path, "rb") as f:
         body = f.read()
-    if ext in (".html", ".js"):
+    if ext in (".html", ".js", ".webmanifest"):
         body = body.replace(b"__PC_NAME__", PC_NAME.encode())
     return body, UI_TYPES.get(ext, "application/octet-stream")
 
@@ -968,7 +968,7 @@ STRATA_PATHS = ("health", "api/health", "metrics", "status", "config", "settings
 # Paths that run the model, run tools or change settings: tailnet devices only.
 # The dashboard is also reachable from the home Wi-Fi with no login, and the
 # Hermes agent behind the chat has a terminal on the Mac.
-CONTROL_PATHS = ("v1/", "config", "settings", "load", "unload", "mcp")
+CONTROL_PATHS = ("v1/", "config", "settings", "load", "unload", "mcp", "api/chats")
 
 # The Hermes agent's OpenAI-compatible API server (gateway platform api_server).
 AGENT_URL = os.environ.get("HERMES_AGENT_URL", "").rstrip("/")
@@ -980,6 +980,91 @@ AGENT_PROVIDER_OLLAMA = os.environ.get("HERMES_AGENT_PROVIDER_OLLAMA", "custom:p
 OLLAMA_CHAT_MODEL = os.environ.get("HERMES_OLLAMA_CHAT_MODEL", "qwen3.5:9b")
 # Strata-only request fields other servers would reject or ignore.
 STRATA_ONLY_FIELDS = ("strata_mcp", "experimental_speed_projection")
+
+
+# --- chat history -------------------------------------------------------------
+# Every conversation is one JSON file, so the Mac and the phone see the same list
+# (Strata's page alone keeps one chat in each browser's localStorage). On zimaos
+# /data is the persistent ./state volume. Read and written from tailnet clients only.
+CHATS_DIR = os.environ.get("HERMES_CHATS_DIR") or (
+    "/data/chats" if os.path.isdir("/data") else os.path.expanduser("~/.hermes-dashboard/chats"))
+_chats_lock = threading.Lock()
+
+
+def _chat_path(cid):
+    if not cid or len(cid) > 48 or not all(c.isalnum() or c == "-" for c in cid):
+        return None
+    return os.path.join(CHATS_DIR, cid + ".json")
+
+
+def chats_list():
+    out = []
+    with _chats_lock:
+        if not os.path.isdir(CHATS_DIR):
+            return out
+        for name in os.listdir(CHATS_DIR):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(CHATS_DIR, name)) as f:
+                    c = json.load(f)
+            except (OSError, ValueError):
+                continue
+            out.append({"id": c.get("id"), "title": c.get("title") or "New chat", "updated": c.get("updated", 0),
+                        "target": c.get("target"), "count": len(c.get("messages") or [])})
+    return sorted(out, key=lambda c: c["updated"], reverse=True)
+
+
+def chat_get(cid):
+    p = _chat_path(cid)
+    if not p or not os.path.isfile(p):
+        return None
+    with _chats_lock, open(p) as f:
+        return json.load(f)
+
+
+def chat_put(cid, data):
+    """Create or update. A title is kept once set (renamed or derived from the first question)."""
+    p = _chat_path(cid)
+    if not p or not isinstance(data, dict):
+        return None
+    with _chats_lock:
+        os.makedirs(CHATS_DIR, exist_ok=True)
+        cur = {}
+        if os.path.isfile(p):
+            try:
+                with open(p) as f:
+                    cur = json.load(f)
+            except (OSError, ValueError):
+                cur = {}
+        cur["id"] = cid
+        cur.setdefault("created", time.time())
+        for k in ("messages", "target"):
+            if k in data:
+                cur[k] = data[k]
+        if data.get("title"):
+            cur["title"] = str(data["title"])[:120]
+        if not cur.get("title"):
+            first = next((m.get("text") for m in cur.get("messages") or []
+                          if m.get("role") == "user" and m.get("text")), "")
+            if first:
+                first = " ".join(first.split())
+                cur["title"] = first[:60] + ("…" if len(first) > 60 else "")
+        cur["updated"] = time.time()
+        tmp = p + ".part"
+        with open(tmp, "w") as f:
+            json.dump(cur, f)
+        os.replace(tmp, p)       # never a half-written chat
+        return {k: cur.get(k) for k in ("id", "title", "updated", "target")}
+
+
+def chat_delete(cid):
+    p = _chat_path(cid)
+    with _chats_lock:
+        if p and os.path.isfile(p):
+            os.remove(p)
+            return True
+    return False
 
 
 def _tailnet(ip):
@@ -1176,10 +1261,41 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, f[0], f[1]) if f else self._err(404, "not found")
         if path.startswith(CONTROL_PATHS) and not _tailnet(self.client_address[0]):
             return self._err(403, "Only from a Tailscale device.")
+        if path == "api/chats":
+            return self._send(200, chats_list())
+        if path.startswith("api/chats/"):
+            c = chat_get(path[len("api/chats/"):])
+            return self._send(200, c) if c else self._err(404, "no such chat")
         if path in STRATA_PATHS or path.startswith("v1/"):
             if path == "v1/models":
                 path = "models"
             return self._strata_path("GET", path, u.query, None)
+        if path in ("manifest.webmanifest", "icon-192.png", "icon-512.png", "apple-touch-icon.png"):
+            f = ui_file(path)
+            ctype = "application/manifest+json" if path.endswith("manifest") else "image/png"
+            return self._send(200, f[0], ctype) if f else self._err(404, "not found")
+        self._err(404, "not found")
+
+    def do_PUT(self):
+        path = urllib.parse.urlsplit(self.path).path.lstrip("/")
+        raw = self._body()
+        if not _tailnet(self.client_address[0]):
+            return self._err(403, "Only from a Tailscale device.")
+        if path.startswith("api/chats/"):
+            try:
+                data = json.loads(raw or b"{}")
+            except ValueError:
+                return self._err(400, "bad JSON")
+            r = chat_put(path[len("api/chats/"):], data)
+            return self._send(200, r) if r else self._err(400, "bad chat id")
+        self._err(404, "not found")
+
+    def do_DELETE(self):
+        path = urllib.parse.urlsplit(self.path).path.lstrip("/")
+        if not _tailnet(self.client_address[0]):
+            return self._err(403, "Only from a Tailscale device.")
+        if path.startswith("api/chats/"):
+            return self._send(200, {"ok": chat_delete(path[len("api/chats/"):])})
         self._err(404, "not found")
 
     def do_POST(self):

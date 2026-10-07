@@ -132,6 +132,7 @@
     for (const b of $("chat-target").querySelectorAll("button")) b.onclick = () => setTarget(b.dataset.t);
   }
   function setTarget(t) { target = t; store.set("dash.chat-target", t); paintTarget(); }
+  window.dashSetTarget = setTarget;   // chats.js: an opened chat brings back who it talked to
   function paintTarget() {
     for (const b of document.querySelectorAll("#mg-target button, #chat-target button"))
       b.setAttribute("aria-pressed", String(b.dataset.t === target));
@@ -323,7 +324,7 @@
     $("manage").insertAdjacentHTML("beforeend", `<div class="st-card wide" id="mg-layout">
       <div class="mg-row" style="justify-content:space-between"><span class="card-title">Monitor layout</span>
         <button class="st-btn st-btn--secondary" id="mg-layout-reset">Reset</button></div>
-      <p class="muted small">Tick what the Monitor shows; the arrows move a card. Kept in this browser.</p>
+      <p class="muted small">Tick what the Monitor shows. Drag to reorder — here or straight on the Monitor (on a phone: hold a card, then drag). Kept in this browser.</p>
       <div class="mg-layout" id="mg-cards"></div>
       <span class="card-title" style="font-size:var(--st-fs-md)">Sections</span>
       <div class="mg-layout" id="mg-sections"></div></div>`);
@@ -346,8 +347,67 @@
       saveLayout(); paintLayoutCard(); applyLayout(); };
     for (const c of $("mg-sections").querySelectorAll("input")) c.onchange = () => { layout.sections[c.dataset.s] = c.checked; saveLayout(); applyLayout(); };
   }
+  // Drag and drop. Pointer events rather than HTML5 drag-and-drop, which iOS Safari does not do: a mouse drags
+  // after a few pixels; a finger has to hold still for 350 ms first, so an ordinary swipe still scrolls the page.
+  // The order changes live while dragging (the cards reflow through CSS order) and is saved on release.
+  function sortable(container, itemSel, keyOf, onDone) {
+    let drag = null;
+    const keyAt = (x, y) => { const el = document.elementFromPoint(x, y); const it = el && el.closest(itemSel);
+      return it && container.contains(it) ? keyOf(it) : null; };
+    const move = (x, y) => {
+      const k = keyAt(x, y);
+      if (!k || k === drag.key) return;
+      const o = layout.order, from = o.indexOf(drag.key), to = o.indexOf(k);
+      o.splice(from, 1); o.splice(to, 0, drag.key);
+      applyLayout(); if (container.id === "mg-cards") paintLayoutCard(drag.key);
+    };
+    const end = () => {
+      if (!drag) return;
+      document.querySelectorAll(".dash-dragging").forEach((e) => e.classList.remove("dash-dragging"));
+      document.body.classList.remove("dash-drag-active");
+      clearTimeout(drag.timer);
+      if (drag.active) {
+        saveLayout(); onDone();
+        // the release must not also count as a click (it would tick a checkbox under the pointer)
+        const eat = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+        window.addEventListener("click", eat, {capture: true, once: true});
+        setTimeout(() => window.removeEventListener("click", eat, {capture: true}), 50);
+      }
+      drag = null;
+    };
+    container.addEventListener("pointerdown", (e) => {
+      const it = e.target.closest(itemSel);
+      if (!it || !container.contains(it) || e.button > 0 || e.target.closest("button, input, a")) return;
+      drag = {key: keyOf(it), x: e.clientX, y: e.clientY, active: false, touch: e.pointerType !== "mouse", el: it};
+      const start = () => { if (!drag) return; drag.active = true; drag.el.classList.add("dash-dragging");
+                            document.body.classList.add("dash-drag-active"); };
+      if (drag.touch) drag.timer = setTimeout(start, 350);
+    });
+    window.addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      const far = Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 6;
+      if (!drag.active) {
+        if (drag.touch) { if (far) { clearTimeout(drag.timer); drag = null; } return; }   // a swipe: let it scroll
+        if (!far) return;
+        drag.active = true; drag.el.classList.add("dash-dragging"); document.body.classList.add("dash-drag-active");
+      }
+      e.preventDefault();
+      move(e.clientX, e.clientY);
+      const cur = [...container.querySelectorAll(itemSel)].find((x) => keyOf(x) === drag.key);
+      if (cur && cur !== drag.el) { drag.el.classList.remove("dash-dragging"); drag.el = cur; cur.classList.add("dash-dragging"); }
+    }, {passive: false});
+    // a finger that is dragging must not scroll the page underneath
+    window.addEventListener("touchmove", (e) => { if (drag && drag.active) e.preventDefault(); }, {passive: false});
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+  }
+
   document.head.insertAdjacentHTML("beforeend", `<style>
 .dash-off{display:none!important}
+#metrics .metric-card{cursor:grab;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+.mg-item{cursor:grab;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+.dash-dragging{opacity:.55;outline:2px dashed var(--st-accent);outline-offset:2px;cursor:grabbing}
+body.dash-drag-active,body.dash-drag-active *{cursor:grabbing!important}
 .monitor-row.dash-single{grid-template-columns:1fr}
 .mg-layout{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:6px 16px}
 .mg-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 4px 4px 10px;border:1px solid var(--st-line-soft);border-radius:10px;font-size:var(--st-fs-md)}
@@ -367,6 +427,8 @@
   }
   document.addEventListener("DOMContentLoaded", () => {
     build(); buildLayoutCard(); buildExtraCards(); applyLayout();
+    sortable($("metrics"), ".metric-card", (it) => it.querySelector(".st-metric__value").id.slice(3), () => paintLayoutCard());
+    sortable($("mg-cards"), ".mg-item", (it) => it.querySelector("input").dataset.k, () => {});
     buildComposerSwitch(); paintTarget(); poll();
   });
 })();

@@ -1,0 +1,70 @@
+/* The dashboard's layout additions to Strata's page: the chat history sidebar and the phone layout.
+   Tokens come from Strata's kit (tokens.css), so both themes follow. */
+
+/* body is 100% high in app.css; on phones 100dvh follows the browser bars and the on-screen keyboard */
+html, body { height: 100dvh; }
+body { padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); }
+
+/* ---------------------------------------------------------------- chat history */
+#view-chat { flex-direction: row; }
+.chat-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.chat-side { width: 272px; flex: none; display: flex; flex-direction: column; gap: 10px; min-height: 0;
+             padding: 14px 10px; background: var(--st-surface); border-right: 1px solid var(--st-line); }
+.chat-side__head { display: flex; gap: 6px; }
+.chat-side__new { flex: 1; justify-content: flex-start; height: 40px; }
+.chat-side__close { display: none; }
+.chat-side__close .st-icon { transform: rotate(90deg); }
+.chat-side__search { height: 38px; font-size: var(--st-fs-sm); }
+.chat-side__list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; margin: 0 -4px; padding: 0 4px;
+                   overscroll-behavior: contain; }
+.chat-side__group { font-size: var(--st-fs-xs); font-weight: 500; color: var(--st-ink-muted); padding: 12px 8px 4px; }
+.chat-side__foot { margin: 0; padding: 0 6px; }
+.chat-item { display: flex; align-items: center; border-radius: 10px; }
+.chat-item:hover, .chat-item.on { background: var(--st-surface-2); }
+.chat-item__open { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; padding: 9px 8px; border: 0;
+                   background: none; color: var(--st-ink); font: inherit; text-align: left; cursor: pointer; }
+.chat-item__title { font-size: var(--st-fs-md); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-item.on .chat-item__title { font-weight: var(--st-fw-bold); }
+.chat-item__meta { font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.chat-item__act { width: 30px; height: 30px; opacity: 0; flex: none; }
+.chat-item:hover .chat-item__act, .chat-item.on .chat-item__act, .chat-item__act:focus-visible { opacity: 1; }
+@media (hover: none) { .chat-item__act { opacity: .75; } }
+.chat-topbar { display: none; }
+.chat-scrim { position: fixed; inset: 0; z-index: 39; background: rgba(0, 0, 0, .45); }
+
+/* ---------------------------------------------------------------- tablets: the list becomes a drawer */
+@media (max-width: 900px) {
+  .chat-side { position: fixed; top: 0; bottom: 0; left: 0; z-index: 40; width: min(86vw, 320px);
+               padding-top: calc(14px + env(safe-area-inset-top)); padding-bottom: calc(14px + env(safe-area-inset-bottom));
+               transform: translateX(-102%); transition: transform 220ms var(--st-ease); box-shadow: var(--st-sh-pop); }
+  body.side-open .chat-side { transform: none; }
+  .chat-side__close { display: inline-flex; }
+  .chat-side .chat-item__open { padding: 11px 8px; }          /* finger-sized rows */
+  .chat-topbar { display: flex; align-items: center; gap: 6px; padding: 6px 10px; flex: none;
+                 border-bottom: 1px solid var(--st-line-soft); }
+  .chat-topbar__title { flex: 1; min-width: 0; text-align: center; font-weight: var(--st-fw-bold); font-size: var(--st-fs-md);
+                        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+}
+
+/* ---------------------------------------------------------------- phones */
+@media (max-width: 640px) {
+  .st-header { height: calc(54px + env(safe-area-inset-top)); padding-top: env(safe-area-inset-top); }
+  .st-header__brand { font-size: var(--st-fs-base); }
+  /* four tabs as icons: the labels do not fit beside the name at 390 px */
+  .st-tab { font-size: 0; gap: 0; padding: 0 11px; height: 38px; }
+  .st-tab .st-icon { display: inline-block !important; width: 20px; height: 20px; }
+  .st-header .st-pill { padding: 0 9px; }
+  .chat { padding: var(--st-s-4) var(--st-s-3); gap: var(--st-s-4); }
+  .composer-wrap { padding: 0 var(--st-s-2) calc(var(--st-s-2) + env(safe-area-inset-bottom)); }
+  .st-composer { padding: 8px; border-radius: var(--st-r-md); }
+  /* 16 px keeps iOS from zooming into the field */
+  #input { font-size: 16px; min-height: 40px; }
+  .st-composer__bar { gap: 2px; flex-wrap: nowrap; }
+  .st-composer__bar .st-btn--icon { width: 34px; height: 34px; }
+  #export-btn, #composer-hint { display: none; }
+  .chat-target button { padding: 0 8px; height: 30px; }
+  .st-msg { max-width: 100%; }
+  .st-toasts { left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); }
+  .st-toast { max-width: none; }
+  .manage { padding: var(--st-s-3) !important; }
+}
