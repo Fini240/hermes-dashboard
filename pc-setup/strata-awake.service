@@ -1,0 +1,20 @@
+# Keep the PC awake while Strata holds the GPU.
+#
+# A suspend with Strata resident does not resume on an RX 6700 XT (ROCm): the box
+# hangs at "PM: suspend entry" and needs a hard power cycle (seen twice on
+# 2026-10-07). The 20-strata sleep hook was meant to stop Strata first, but it did
+# not run at all on that suspend (systemd 261). A block inhibitor is enforced by
+# logind itself, so the idle timer's `systemctl suspend` is simply refused while
+# this runs. Bound to strata.service: starts and stops with it.
+#
+# Install: copy to /etc/systemd/system/, systemctl daemon-reload, systemctl enable strata-awake.
+[Unit]
+Description=Keep the PC awake while Strata holds the GPU
+BindsTo=strata.service
+After=strata.service
+
+[Service]
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --mode=block --who=Strata --why="Strata is loaded: a suspend with it resident does not resume" sleep infinity
+
+[Install]
+WantedBy=strata.service

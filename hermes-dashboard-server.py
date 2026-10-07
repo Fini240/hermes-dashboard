@@ -481,6 +481,11 @@ def power_action(action):
         else:
             ps = "shutdown /s /t 5 | Out-Null; 'queued'"
         target, remote = WIN_USER + "@" + HOST, _win_cmd(ps)
+    elif action == "suspend" and (_snap().get("engine") or {}).get("active") == "strata":
+        # A suspend with Strata loaded does not resume (the PC hangs and needs a
+        # power cycle); strata-awake blocks it anyway. Say why instead of failing.
+        return False, ("Strata is running, and the PC cannot sleep with it loaded. "
+                       "Switch to Ollama first, then Suspend.")
     else:
         cmd = "systemctl suspend" if action == "suspend" else "systemctl poweroff"
         target = "root@" + HOST
