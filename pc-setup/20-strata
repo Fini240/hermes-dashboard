@@ -1,0 +1,31 @@
+#!/bin/bash
+# systemd-sleep hook: never suspend with Strata resident on the GPU.
+# Install: /etc/systemd/system-sleep/20-strata (chmod 755).
+#
+# Same failure as 10-ollama-gpu guards against: a suspend with a ROCm process
+# holding VRAM can fail to resume, and the box comes back as a cold boot (seen
+# 2026-10-07 with Strata loaded). So stop Strata before every suspend, whoever
+# triggers it — the idle timer, the dashboard's Suspend button, or a key press —
+# and hand the GPU back to Ollama after resume, which is the box's default.
+set -u
+FLAG=/run/strata-was-running
+USER_NAME=user   # the account that owns Ollama's user unit
+UID_NUM=1000
+
+case "${1:-}" in
+    pre)
+        if systemctl is-active --quiet strata.service; then
+            touch "$FLAG"
+            systemctl stop strata.service || true
+        fi
+        ;;
+    post)
+        if [ -e "$FLAG" ]; then
+            rm -f "$FLAG"
+            runuser -u "$USER_NAME" -- env \
+                XDG_RUNTIME_DIR="/run/user/$UID_NUM" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_NUM/bus" \
+                systemctl --user start ollama.service || true
+        fi
+        ;;
+esac

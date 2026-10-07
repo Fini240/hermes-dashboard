@@ -1,0 +1,75 @@
+#!/bin/bash
+# Switch the GPU between Ollama and Strata, or report which one has it.
+#
+#   llm-engine ollama | strata    switch (prints "ok")
+#   llm-engine probe              key=value lines for the dashboard's PROBE
+#
+# Lives on the PC, like rgb-apply, so the dashboard composes no service names
+# or addresses itself. Strata's address is read from its own config file.
+set -u
+STRATA_CFG=${STRATA_CFG:-/home/user/Strata/strata-coder-iq1_m.json}
+USER_NAME=user   # the account that owns Ollama's user unit
+UID_NUM=1000
+
+# Ollama runs as that account's user unit (see 10-ollama-gpu), not a system service.
+ollama_ctl() {
+    runuser -u "$USER_NAME" -- env \
+        XDG_RUNTIME_DIR="/run/user/$UID_NUM" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_NUM/bus" \
+        systemctl --user "$@"
+}
+
+strata_cfg() {
+    python3 - "$STRATA_CFG" "$1" <<'EOF' 2>/dev/null
+import json, sys
+c = json.load(open(sys.argv[1]))
+print({"url": "http://%s:%s" % (c.get("host") or "127.0.0.1", c.get("port") or 8080),
+       "key": c.get("api_key") or ""}[sys.argv[2]])
+EOF
+}
+
+case "${1:-}" in
+    strata)
+        ollama_ctl stop ollama.service
+        systemctl start strata.service && echo ok
+        ;;
+    ollama)
+        systemctl stop strata.service
+        ollama_ctl start ollama.service && echo ok
+        ;;
+    probe)
+        echo "engine_avail=1"
+        s=$(systemctl is-active strata.service 2>/dev/null)
+        o=$(ollama_ctl is-active ollama.service 2>/dev/null)
+        echo "engine_strata=$s"
+        echo "engine_ollama=$o"
+        if [ "$s" = active ]; then
+            # With an api_key in the config every endpoint wants it, /status
+            # included. While the model is still loading (~80 s) the server does
+            # not answer yet: report that as "loading".
+            st=$(curl -s --max-time 2 -H "Authorization: Bearer $(strata_cfg key)" \
+                 "$(strata_cfg url)/status" 2>/dev/null)
+            if [ -n "$st" ]; then
+                # /status: "busy", plus tokens_per_s once the first token is out
+                # (before that it is still reading the prompt).
+                printf '%s' "$st" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if "busy" not in d:
+    print("strata_state=error")
+elif not d["busy"]:
+    print("strata_state=idle")
+else:
+    tps = d.get("tokens_per_s")
+    print("strata_state=%s" % ("generating" if tps else "reading"))
+    print("strata_tok_s=%s" % (tps or ""))' 2>/dev/null
+            else
+                echo "strata_state=loading"
+            fi
+        fi
+        ;;
+    *)
+        echo "usage: llm-engine ollama|strata|probe" >&2
+        exit 2
+        ;;
+esac

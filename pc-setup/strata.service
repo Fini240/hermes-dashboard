@@ -1,0 +1,31 @@
+# Strata (github.com/Niko1221/Strata) as a switchable alternative to Ollama.
+#
+# Both engines need the whole GPU, so only one may run. Ollama on this box is a
+# *user* unit (the desktop user's), which a system unit's Conflicts= cannot reach — so the
+# exclusion lives in llm-engine, the only thing that starts this. Deliberately
+# NOT enabled: the box boots into Ollama, and the dashboard's engine switch
+# starts this on demand.
+#
+# Install: copy to /etc/systemd/system/, adjust User/paths, systemctl daemon-reload.
+[Unit]
+Description=Strata LLM server (takes the GPU from Ollama while it runs)
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+User=user
+Environment=HOME=/home/user
+WorkingDirectory=/home/user/Strata
+# The config holds host, port and API key; setup's run-*.sh adds --open, which
+# would try to start a browser on a headless service.
+ExecStart=/home/user/Strata/.venv/bin/python serve/server.py --engine strata --config strata-coder-iq1_m.json --port 8080
+# The engine is a child of the Python server; stop the whole group so no orphan
+# keeps holding ~6 GB of VRAM and 25 GB of RAM.
+KillMode=control-group
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

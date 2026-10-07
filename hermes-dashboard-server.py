@@ -134,6 +134,10 @@ echo "mon_off=$_mon_off"
 echo "rgb=$(cat /var/lib/hermes-rgb/state 2>/dev/null)"
 [ -x /usr/local/bin/rgb-apply ] && echo "rgb_avail=1" || echo "rgb_avail=0"
 echo "rgb_auto=$(systemctl is-active rgb-auto 2>/dev/null)"
+# Which engine holds the GPU, Ollama or Strata (and Strata's live state).
+# llm-engine lives on the PC (pc-setup/), so service names, Strata's address
+# and its API key stay there; absent, the engine card simply does not render.
+[ -x /usr/local/bin/llm-engine ] && /usr/local/bin/llm-engine probe 2>/dev/null
 # True generation speed straight from Ollama's own llama-server timings, which
 # it logs to the system journal (identifier "ollama"). This is the real tok/s of
 # the last completed response for ANY client, not just Hermes traffic, and it
@@ -414,6 +418,34 @@ def rgb_auto_action(on):
             return True, ("lighting now follows the load — red while working, "
                           "green when idle" if on else
                           "automatic lighting off — the colour stays where it is")
+        err = (r.stderr or r.stdout or "command failed").strip().splitlines()
+        return False, (err[-1] if err else "command failed")[:160]
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, str(e)[:160]
+
+
+ENGINES = ("ollama", "strata")
+
+
+def engine_action(engine):
+    """Hand the GPU to Ollama or to Strata.
+
+    Both need the whole card, so exactly one runs. `llm-engine` on the PC does
+    the switch (stop one, start the other); the dashboard only names the target.
+    Starting Strata returns at once, but the model then takes ~80 s to load —
+    the probe reports that as "loading", so the card says so honestly.
+    """
+    if engine not in ENGINES:
+        return False, "unknown engine"
+    if pc_os() == "windows":
+        return False, "the engine switch is Linux-only"
+    try:
+        r = subprocess.run(["ssh", *SSH_OPTS, "root@" + HOST,
+                            "/usr/local/bin/llm-engine " + engine],
+                           capture_output=True, text=True, timeout=90)
+        if r.returncode == 0 and "ok" in r.stdout:
+            return True, ("Strata is loading — about 80 s until it answers"
+                          if engine == "strata" else "Ollama has the GPU again")
         err = (r.stderr or r.stdout or "command failed").strip().splitlines()
         return False, (err[-1] if err else "command failed")[:160]
     except (subprocess.TimeoutExpired, OSError) as e:
@@ -704,6 +736,25 @@ def poller():
             except (TypeError, ValueError):
                 pass
 
+        # Which engine has the GPU. "loading" while Strata reads its weights.
+        # Strata logs nothing to the journal, so while it generates its own
+        # live rate stands in for the Ollama journal figure above.
+        engine = None
+        if pc and pc.get("engine_avail") == "1":
+            if pc.get("engine_strata") in ("active", "activating"):
+                engine = {"active": "strata",
+                          "state": pc.get("strata_state") or "loading"}
+                try:
+                    tps = float(pc.get("strata_tok_s") or 0)
+                except ValueError:
+                    tps = 0
+                if engine["state"] == "generating" and tps > 0:
+                    gen_rate, gen_age = tps, 0.0
+            elif pc.get("engine_ollama") in ("active", "activating"):
+                engine = {"active": "ollama", "state": "ready"}
+            else:
+                engine = {"active": None, "state": "none"}
+
         # on / off / mixed for the monitors, or None when it cannot be known
         # (PC unreachable, booted into Windows, or no display attached at all).
         monitors = None
@@ -723,6 +774,7 @@ def poller():
         snap = {"ok": True, "ts": t0,
                 "online": pc is not None or oll is not None,
                 "monitors": monitors,
+                "engine": engine,
                 # Lighting preset, or None when it cannot be known: PC down,
                 # booted into Windows, or OpenRGB not set up on it.
                 "rgb": ((pc.get("rgb") or None)
@@ -905,6 +957,8 @@ button.pw .sw:last-of-type{margin-right:9px}
    carries its own on/off state rather than arming and firing. */
 button.pw.mini{min-width:0;padding:9px 13px}
 button.pw.mini.on{color:var(--fg);border-color:var(--grn)}
+/* Engine switch: the running engine is lit, like the Auto toggle. */
+button.pw.eng.on{color:var(--fg);border-color:var(--grn);cursor:default}
 footer{color:var(--faint);font-size:12px;margin-top:30px;text-align:center}
 </style></head><body><div class="wrap">
 <header><h1>__PC_NAME__</h1><span class="pill" id="status"><i class="dot"></i>connecting</span></header>
@@ -1077,6 +1131,18 @@ async function tick(){
       'swatches switches the lighting off. Auto hands the lighting to the PC itself: '+
       'red while it is working, green while it is idle. Picking a colour by hand turns '+
       'Auto back off.</div></div>');
+    // Which engine holds the GPU. data-keep like the Power card, so a click's
+    // "switching…" state survives the 2s re-render; syncEngine() relabels it.
+    B.push('<div class="card" data-keep><div class="label">Model engine</div>'+
+      '<div class="power">'+
+      '<button class="pw eng" data-eng="ollama" onclick="doEngine(this)">'+
+      '<i class="dot dim"></i><span>Ollama</span></button>'+
+      '<button class="pw eng" data-eng="strata" onclick="doEngine(this)">'+
+      '<i class="dot dim"></i><span>Strata 125B</span></button>'+
+      '</div><div class="note" id="engmsg">Only one engine runs at a time — both need the whole '+
+      'GPU. Ollama: the everyday models, fastest overall. Strata: the 125B coder, '+
+      'strongest at code (~33 tok/s, about 80 s to load). The PC stops Strata before it '+
+      'suspends and comes back with Ollama.</div></div>');
     if(p.top&&p.top.length)
       B.push('<div class="card"><div class="label">Top processes · up '+dur(p.uptime)+'</div>'+
         p.top.map(t=>{const q=t.trim().split(/\s+/);
@@ -1174,6 +1240,7 @@ async function tick(){
   syncMonitors(s);
   syncRgb(s);
   syncRgbAuto(s);
+  syncEngine(s);
   document.getElementById('sub').textContent='__PC_HOST__ · over Tailscale · updated '+
     new Date(s.ts*1000).toLocaleTimeString();
 }
@@ -1297,6 +1364,43 @@ async function doRgb(color){
   // Hand back to the poll, which reads the PC's own record of what it applied.
   setTimeout(()=>{b._busy=false;},4000);
 }
+// The lit button is the engine the PC reports running, not the last click.
+const ENG_STATE={loading:'loading…',idle:'ready',reading:'reading prompt',
+  generating:'generating',ready:'ready',error:'not answering'};
+function syncEngine(s){
+  const bs=document.querySelectorAll('button.eng'); if(!bs.length) return;
+  const e=s.engine;
+  bs.forEach(b=>{
+    if(b._busy) return;
+    const d=b.querySelector('i'), t=b.querySelector('span');
+    const name=b.dataset.eng==='strata'?'Strata 125B':'Ollama';
+    if(!e){
+      b.disabled=true; b.classList.remove('on'); d.className='dot dim'; t.textContent=name;
+      b.title=s.host_stats?'llm-engine is not set up on the PC.':'Needs the SSH probe, which is not answering.';
+      return;
+    }
+    const on=e.active===b.dataset.eng;
+    b.disabled=false; b.classList.toggle('on',on);
+    d.className=!on?'dot dim':(e.state==='loading'||e.state==='error'?'dot mix':'dot');
+    t.textContent=on?name+' · '+(ENG_STATE[e.state]||e.state):name;
+    b.title=on?'Running now':'Hand the GPU to '+name;
+  });
+}
+async function doEngine(b){
+  const want=b.dataset.eng, msg=document.getElementById('engmsg');
+  if(b.disabled||b.classList.contains('on')) return;
+  const all=document.querySelectorAll('button.eng');
+  all.forEach(o=>{o._busy=true;o.disabled=true;});
+  b.querySelector('span').textContent='Switching…';
+  try{
+    const r=await(await fetch('/api/engine',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({engine:want})})).json();
+    if(msg)msg.textContent=r.message;
+  }catch(e){ if(msg)msg.textContent='Could not reach the dashboard server.'; }
+  // Hand back to the poll, which reads what the PC is really running.
+  setTimeout(()=>{all.forEach(o=>{o._busy=false;});},3000);
+}
 async function doWake(){
   const b=document.querySelector('button.wake'), m=document.getElementById('wakemsg');
   if(b){b.disabled=true;b.textContent='Sending magic packet…';}
@@ -1366,6 +1470,13 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 color = ""
             ok, msg = rgb_action(color)
+        elif self.path.startswith("/api/engine"):
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                engine = json.loads(self.rfile.read(n) or b"{}").get("engine", "")
+            except ValueError:
+                engine = ""
+            ok, msg = engine_action(engine)
         elif self.path.startswith("/api/wake"):
             # direct=1 comes from another dashboard relaying to us: broadcast
             # locally only, never relay onward, so the two can't ping-pong.
