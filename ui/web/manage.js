@@ -254,14 +254,119 @@
     }
   }
 
+  // ---------------------------------------------------------------- Monitor layout
+  // Which metric cards the Monitor shows, in which order, and which of its sections. Kept per browser (a
+  // viewing preference). Strata's own cards are found by their value element (mv-<key>); the extra cards below
+  // come from this dashboard's probe, which also sees what Strata cannot (CPU temperature, system draw, fan).
+  const CARDS = {
+    speed: "Speed", gpu: "GPU load", vram: "VRAM", temp: "GPU temp", sysw: "System draw", cpu: "CPU",
+    cputemp: "CPU temp", ram: "RAM", power: "GPU power", fan: "GPU fan", disk: "Disk read", pcie: "PCIe"};
+  const EXTRA = {
+    sysw: {icon: "bolt", max: 750}, cputemp: {icon: "thermometer", max: 95, tone: "warn"},
+    ram: {icon: "memory", max: 100}, fan: {icon: "activity", max: 3500, tone: "info"}};
+  const SECTIONS = {state: ["Model state", ".state-card"], ctx: ["Context and memory", ".ctx-card"],
+                    req: ["Recent requests", ".req-card"], cc: ["Conversation cache", "#cc-card"]};
+  // PCIe stays empty on AMD cards (Strata reads it through NVML), so it starts hidden; GPU power is folded into
+  // System draw's line, disk reads matter only when experts stream from the SSD.
+  const DEFAULT_LAYOUT = {order: ["speed", "gpu", "vram", "temp", "sysw", "cpu", "cputemp", "ram", "power", "fan", "disk", "pcie"],
+                          hidden: ["power", "fan", "disk", "pcie"], sections: {state: true, ctx: true, req: true, cc: true}};
+  let layout;
+  try { layout = JSON.parse(store.get("dash.monitor-layout", "null")); } catch (e) { layout = null; }
+  if (!layout || !Array.isArray(layout.order)) layout = JSON.parse(JSON.stringify(DEFAULT_LAYOUT));
+  for (const k of Object.keys(CARDS)) if (!layout.order.includes(k)) { layout.order.push(k); layout.hidden.push(k); }
+  layout.sections = Object.assign({}, DEFAULT_LAYOUT.sections, layout.sections || {});
+  const saveLayout = () => store.set("dash.monitor-layout", JSON.stringify(layout));
+  const H = {sysw: [], cputemp: [], ram: [], fan: []};
+
+  function cardEl(key) { const v = $(`mv-${key}`); return v ? v.closest(".metric-card") : null; }
+  function buildExtraCards() {
+    const grid = $("metrics"); if (!grid) return;
+    for (const [key, x] of Object.entries(EXTRA)) {
+      if ($(`mv-${key}`)) continue;
+      grid.insertAdjacentHTML("beforeend", `<div class="st-card metric-card"><div class="st-metric">
+        <span class="st-metric__label">${icon(x.icon)}${esc(CARDS[key])}</span>
+        <span class="st-metric__value" id="mv-${key}">–</span><span class="st-metric__sub" id="ms-${key}"></span>
+        <svg class="st-metric__spark" id="sp-${key}" viewBox="0 0 100 32" preserveAspectRatio="none"${x.tone ? ` data-tone="${x.tone}"` : ""}>
+          <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
+          stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg></div></div>`);
+    }
+    const pw = cardEl("power"); if (pw) { const l = pw.querySelector(".st-metric__label"); if (l) l.lastChild.textContent = "GPU power"; }
+  }
+  function applyLayout() {
+    layout.order.forEach((k, i) => { const c = cardEl(k); if (c) { c.style.order = i; c.classList.toggle("dash-off", layout.hidden.includes(k)); } });
+    for (const [k, [, sel]] of Object.entries(SECTIONS)) { const el = document.querySelector(sel); if (el) el.classList.toggle("dash-off", !layout.sections[k]); }
+    const row = document.querySelector(".monitor-row");
+    if (row) row.classList.toggle("dash-single", !layout.sections.ctx || !layout.sections.req);
+  }
+  function setVal(key, value, unit, sub) {
+    const v = $(`mv-${key}`); if (!v) return;
+    v.innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
+    $(`ms-${key}`).textContent = sub || "";
+  }
+  function paintExtra(s) {
+    const p = s.pc;
+    if (!p) { for (const k of Object.keys(EXTRA)) setVal(k, null, "", ""); return; }
+    const push = (k, v) => { H[k].push(v == null ? 0 : v); if (H[k].length > 120) H[k].shift(); };
+    setVal("sysw", p.total_watts != null ? Math.round(p.total_watts) : null, "W",
+           p.cpu_watts != null ? `CPU ${Math.round(p.cpu_watts)} W · GPU ${Math.round(p.power)} W · est.` : "");
+    push("sysw", p.total_watts);
+    setVal("cputemp", p.cpu_temp ? Math.round(p.cpu_temp) : null, "°C", p.cpu_freq ? `${p.cpu_freq.toFixed(2)} GHz · load ${p.load.toFixed(2)}` : "");
+    push("cputemp", p.cpu_temp);
+    const rp = p.mem_total ? 100 * p.mem_used / p.mem_total : null;
+    setVal("ram", (p.mem_used / 1073741824).toFixed(1), `/ ${Math.round(p.mem_total / 1073741824)} GB`, rp != null ? `${Math.round(rp)}% used · up ${dur(p.uptime)}` : "");
+    push("ram", rp);
+    setVal("fan", p.fan, "rpm", `GPU ${Math.round(p.temp)} °C`);
+    push("fan", p.fan);
+    if (typeof spark === "function") for (const [k, x] of Object.entries(EXTRA)) spark(`sp-${k}`, H[k], x.max);
+  }
+  function buildLayoutCard() {
+    $("manage").insertAdjacentHTML("beforeend", `<div class="st-card wide" id="mg-layout">
+      <div class="mg-row" style="justify-content:space-between"><span class="card-title">Monitor layout</span>
+        <button class="st-btn st-btn--secondary" id="mg-layout-reset">Reset</button></div>
+      <p class="muted small">Tick what the Monitor shows; the arrows move a card. Kept in this browser.</p>
+      <div class="mg-layout" id="mg-cards"></div>
+      <span class="card-title" style="font-size:var(--st-fs-md)">Sections</span>
+      <div class="mg-layout" id="mg-sections"></div></div>`);
+    $("mg-layout-reset").onclick = () => { layout = JSON.parse(JSON.stringify(DEFAULT_LAYOUT)); saveLayout(); paintLayoutCard(); applyLayout(); };
+    paintLayoutCard();
+  }
+  function paintLayoutCard() {
+    const chev = (dir) => `<svg class="st-icon st-icon--sm" style="transform:rotate(${dir === "up" ? 180 : 0}deg)"><use href="web/sprite.svg#i-chevron"/></svg>`;
+    $("mg-cards").innerHTML = layout.order.map((k, i) => `<div class="mg-item">
+      <label><input type="checkbox" data-k="${k}"${layout.hidden.includes(k) ? "" : " checked"}> ${esc(CARDS[k])}</label>
+      <span><button class="st-btn st-btn--icon" data-mv="${i}" data-d="-1" aria-label="Move up"${i ? "" : " disabled"}>${chev("up")}</button>
+      <button class="st-btn st-btn--icon" data-mv="${i}" data-d="1" aria-label="Move down"${i < layout.order.length - 1 ? "" : " disabled"}>${chev("down")}</button></span></div>`).join("");
+    $("mg-sections").innerHTML = Object.entries(SECTIONS).map(([k, [label]]) => `<div class="mg-item">
+      <label><input type="checkbox" data-s="${k}"${layout.sections[k] ? " checked" : ""}> ${esc(label)}</label></div>`).join("");
+    for (const c of $("mg-cards").querySelectorAll("input")) c.onchange = () => {
+      layout.hidden = layout.hidden.filter((x) => x !== c.dataset.k); if (!c.checked) layout.hidden.push(c.dataset.k);
+      saveLayout(); applyLayout(); };
+    for (const b of $("mg-cards").querySelectorAll("button[data-mv]")) b.onclick = () => {
+      const i = +b.dataset.mv, j = i + +b.dataset.d; [layout.order[i], layout.order[j]] = [layout.order[j], layout.order[i]];
+      saveLayout(); paintLayoutCard(); applyLayout(); };
+    for (const c of $("mg-sections").querySelectorAll("input")) c.onchange = () => { layout.sections[c.dataset.s] = c.checked; saveLayout(); applyLayout(); };
+  }
+  document.head.insertAdjacentHTML("beforeend", `<style>
+.dash-off{display:none!important}
+.monitor-row.dash-single{grid-template-columns:1fr}
+.mg-layout{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:6px 16px}
+.mg-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 4px 4px 10px;border:1px solid var(--st-line-soft);border-radius:10px;font-size:var(--st-fs-md)}
+.mg-item label{display:flex;align-items:center;gap:8px;cursor:pointer}
+.mg-item input{accent-color:var(--st-accent);width:16px;height:16px}
+.mg-item .st-btn--icon{width:30px;height:30px}</style>`);
+
   let tabNow = "chat";
   window.manageShown = (t) => { tabNow = t; };
   async function poll() {
     try {
       const s = await (await realFetch("/api/stats", {cache: "no-store"})).json();
       paint(s);
+      paintExtra(s);
     } catch (e) { /* dashboard server restarting */ }
-    setTimeout(poll, tabNow === "manage" ? 2000 : 5000);
+    setTimeout(poll, tabNow === "manage" || tabNow === "monitor" ? 2000 : 5000);
   }
-  document.addEventListener("DOMContentLoaded", () => { build(); buildComposerSwitch(); paintTarget(); poll(); });
+  document.addEventListener("DOMContentLoaded", () => {
+    build(); buildLayoutCard(); buildExtraCards(); applyLayout();
+    buildComposerSwitch(); paintTarget(); poll();
+  });
 })();

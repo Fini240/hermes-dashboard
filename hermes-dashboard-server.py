@@ -1150,6 +1150,8 @@ class Handler(BaseHTTPRequestHandler):
             if not s.get("online"):
                 return self._err(503, "%s is asleep" % PC_NAME)
             return self._send(200, synth_metrics(s))
+        if path == "mcp":           # no MCP servers while Strata is off: an empty list, not an error
+            return self._send(200, {"servers": [], "tools": 0})
         if path == "models":
             return self._send(200, {"object": "list", "data": [{"id": synth_health(s)["model"], "object": "model"}]})
         # config / settings / mcp / load / unload are Strata's own: absent while it is off,
