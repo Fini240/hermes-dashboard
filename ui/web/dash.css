@@ -3,6 +3,12 @@
 
 /* body is 100% high in app.css; on phones 100dvh follows the browser bars and the on-screen keyboard */
 html, body { height: 100dvh; }
+/* iOS: no double-tap zoom on buttons (a quick second tap on Send zoomed the page) */
+html { touch-action: manipulation; -webkit-text-size-adjust: 100%; }
+/* iOS zooms into any field under 16 px when it gets focus: every field is 16 px on touch screens */
+@media (hover: none) and (pointer: coarse) {
+  input, textarea, select, .st-input, .chat-side__search, #input { font-size: 16px !important; }
+}
 body { padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); }
 
 /* ---------------------------------------------------------------- chat history */
