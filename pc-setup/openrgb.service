@@ -1,6 +1,8 @@
 [Unit]
 Description=OpenRGB lighting server (RGB control for the hermes-dashboard)
-After=multi-user.target
+# Not After=multi-user.target: the unit is WantedBy it, and rgb-auto (After=openrgb) closed an
+# ordering cycle that made systemd drop rgb-auto at random boots. The modules it needs are loaded by then.
+After=systemd-modules-load.service
 
 [Service]
 Type=simple
