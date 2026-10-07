@@ -1,0 +1,37 @@
+#!/bin/sh
+# Point Strata's own web page at the dashboard while Strata runs, so there is one
+# place to chat and manage, not two. Strata's API (which the dashboard uses) is
+# untouched — only the page served at "/" changes.
+#
+#   strata-page redirect   (strata.service ExecStartPre)
+#   strata-page restore    (strata.service ExecStopPost)
+#
+# The file is tracked by Strata's git checkout and update.sh runs `git pull
+# --ff-only`, which refuses to run over local changes. So the redirect exists only
+# while Strata runs and the original is back whenever it is stopped.
+set -u
+STRATA_DIR=${STRATA_DIR:-/home/user/Strata}
+DASHBOARD_URL=${DASHBOARD_URL:-http://192.168.1.60:8765/}
+PAGE="$STRATA_DIR/serve/web/index.html"
+
+case "${1:-}" in
+    redirect)
+        cat > "$PAGE" <<EOF
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="0; url=$DASHBOARD_URL">
+<title>Moved to the dashboard</title>
+<style>body{margin:0;display:grid;place-items:center;min-height:100vh;background:#0e1113;color:#eef1f3;
+font:16px/1.5 system-ui,sans-serif}a{color:#4ade80}</style></head>
+<body><p>Chat and monitor live in the dashboard now: <a href="$DASHBOARD_URL">$DASHBOARD_URL</a></p>
+<script>location.replace("$DASHBOARD_URL")</script></body></html>
+EOF
+        ;;
+    restore)
+        git -C "$STRATA_DIR" checkout -- serve/web/index.html 2>/dev/null || true
+        ;;
+    *)
+        echo "usage: strata-page redirect|restore" >&2
+        exit 2
+        ;;
+esac

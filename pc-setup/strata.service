@@ -18,6 +18,12 @@ Environment=HOME=/home/user
 WorkingDirectory=/home/user/Strata
 # The config holds host, port and API key; setup's run-*.sh adds --open, which
 # would try to start a browser on a headless service.
+# Strata's own page redirects to the dashboard while it runs (one place, not two);
+# restored on stop so update.sh's `git pull --ff-only` finds a clean checkout.
+Environment=STRATA_DIR=/home/user/Strata
+Environment=DASHBOARD_URL=http://192.168.1.60:8765/
+ExecStartPre=/usr/local/bin/strata-page redirect
+ExecStopPost=/usr/local/bin/strata-page restore
 ExecStart=/home/user/Strata/.venv/bin/python serve/server.py --engine strata --config strata-coder-iq1_m.json --port 8080
 # The engine is a child of the Python server; stop the whole group so no orphan
 # keeps holding ~6 GB of VRAM and 25 GB of RAM.
