@@ -73,9 +73,9 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 
 let tab = "chat";
 function showTab(name) {
-  tab = ["chat", "monitor", "about", "manage"].includes(name) ? name : "chat";
+  tab = ["chat", "monitor", "video", "about", "manage"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "monitor", "about", "manage"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "monitor", "video", "about", "manage"]) $(`view-${v}`).hidden = v !== tab;
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") focusInput();
   if (tab === "monitor") loadMcp();

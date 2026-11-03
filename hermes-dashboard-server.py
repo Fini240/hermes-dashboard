@@ -830,6 +830,9 @@ def poller():
                     gen_rate, gen_age = tps, 0.0
             elif pc.get("engine_ollama") in ("active", "activating"):
                 engine = {"active": "ollama", "state": "ready"}
+            elif pc.get("engine_h3") in ("active", "activating"):
+                # the H3 video server borrowed the GPU; it hands it back by itself after the videos
+                engine = {"active": "h3", "state": "rendering" if pc.get("h3_state") == "rendering" else "ready"}
             else:
                 engine = {"active": None, "state": "none"}
         strata = None     # the page reads Strata's /metrics itself, through this server
@@ -987,7 +990,12 @@ STRATA_PATHS = ("health", "api/health", "metrics", "status", "config", "settings
 # Paths that run the model, run tools or change settings: tailnet devices only.
 # The dashboard is also reachable from the home Wi-Fi with no login, and the
 # Hermes agent behind the chat has a terminal on the Mac.
-CONTROL_PATHS = ("v1/", "config", "settings", "load", "unload", "mcp", "api/chats", "api/builder")
+CONTROL_PATHS = ("v1/", "config", "settings", "load", "unload", "mcp", "api/chats", "api/builder", "api/video")
+
+# h3-engine ("Video" tab): MiniMax H3 text/image-to-video on the PC. It borrows the GPU from
+# Strata/Ollama per video and gives it back by itself. Key added here, never sent to the browser.
+H3_URL = os.environ.get("HERMES_H3_URL", "").rstrip("/")
+H3_KEY = os.environ.get("HERMES_H3_KEY", "")
 
 # strata-agent ("Builder" in the chat): Finn's own coding agent on the PC. The page talks to it through
 # /api/builder/* and this server adds the key, so the key never reaches a browser.
@@ -1168,6 +1176,9 @@ def installed_models(s):
         return {"engine": engine, "default": model,
                 "data": s.get("strata_models") or [{"id": model, "object": "model", "label": model if model != "strata" else "Strata 125B"}],
                 "strata_models": s.get("strata_models") or [], "state": (s.get("engine") or {}).get("state")}
+    if engine == "h3":
+        raise ValueError("The GPU is making a video (H3). Chat is back a few minutes after the last video, "
+                         "or choose an engine under Manage.")
     if engine != "ollama":
         raise ValueError("No model engine is ready. Choose one under Manage.")
     with urllib.request.urlopen(OLLAMA + "/api/tags", timeout=6) as r:
@@ -1344,6 +1355,50 @@ class Handler(BaseHTTPRequestHandler):
         return self._proxy(url, method, raw if method == "POST" else None, BUILDER_KEY, stream,
                            timeout=3600 if stream else 30)
 
+    def _video(self, method, path, query, raw):
+        """/api/video/<x> -> h3-engine. health -> /health, files/<id>/<name> -> /files/... (Range passed on)."""
+        if not H3_URL:
+            return self._err(503, "Video is not configured on this dashboard (HERMES_H3_URL).")
+        rest = path[len("api/video/"):]
+        if ".." in rest or not all(c.isalnum() or c in "-_/." for c in rest):
+            return self._err(400, "bad path")
+        if not _snap().get("online"):
+            return self._err(503, "%s is asleep — wake it under Manage." % PC_NAME)
+        if rest == "health":
+            return self._proxy(H3_URL + "/health", "GET", None, "", timeout=5)
+        if rest.startswith("files/") and method == "GET":
+            return self._video_file(H3_URL + "/" + rest)
+        url = H3_URL + "/api/" + rest + (("?" + query) if query else "")
+        return self._proxy(url, method, raw if method == "POST" else None, H3_KEY, timeout=60)
+
+    def _video_file(self, url):
+        """Stream a clip or poster with Range support (Safari will not play a video without it)."""
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + H3_KEY})
+        if self.headers.get("Range"):
+            req.add_header("Range", self.headers["Range"])
+        try:
+            r = urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as e:
+            return self._send(e.code, e.read() or b"{}", e.headers.get("Content-Type") or "application/json")
+        except Exception as e:
+            return self._err(502, "video server not reachable: %s" % str(e)[:120])
+        with r:
+            self.send_response(r.status)
+            for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control"):
+                if r.headers.get(h):
+                    self.send_header(h, r.headers[h])
+            self.end_headers()
+            if self.command == "HEAD":
+                return
+            try:
+                while True:
+                    chunk = r.read(262144)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
     def _chat(self, raw):
         """POST v1/chat/completions from the page: the model on the PC, or the Hermes agent."""
         s = _snap()
@@ -1392,6 +1447,9 @@ class Handler(BaseHTTPRequestHandler):
                                AGENT_KEY, stream, timeout=900, hermes=True)
         if not s.get("online"):
             return self._err(503, "%s is asleep — wake it under Manage." % PC_NAME)
+        if e.get("active") == "h3":
+            return self._err(503, "The GPU is making a video (H3). Chat is back a few minutes after the last "
+                                  "video, or choose an engine under Manage.")
         if strata_up(s):
             body["model"] = e.get("model") or body.get("model") or "strata"
             if isinstance(body.get("messages"), list):
@@ -1469,6 +1527,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"url": VOICE_URL}).encode())
         if path.startswith("api/builder/"):
             return self._builder("GET", path, u.query, None)
+        if path.startswith("api/video/"):
+            return self._video("GET", path, u.query, None)
         if path == "api/chats":
             return self._send(200, chats_list())
         if path.startswith("api/chats/"):
@@ -1504,6 +1564,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(403, "Only from a Tailscale device.")
         if path.startswith("api/chats/"):
             return self._send(200, {"ok": chat_delete(path[len("api/chats/"):])})
+        if path.startswith("api/video/jobs/"):
+            return self._video("DELETE", path, "", None)
         self._err(404, "not found")
 
     def do_POST(self):
@@ -1517,6 +1579,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._chat(raw)
         if path.startswith("api/builder/"):
             return self._builder("POST", path, u.query, raw)
+        if path.startswith("api/video/"):
+            return self._video("POST", path, u.query, raw)
         if path in STRATA_PATHS or path.startswith("v1/"):
             return self._strata_path("POST", path, u.query, raw)
         if path == "api/power":

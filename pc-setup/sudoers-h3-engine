@@ -1,0 +1,3 @@
+# /etc/sudoers.d/h3-engine (mode 0440): the H3 video server (runs as the desktop user)
+# may borrow the GPU and give it back, nothing else.
+user ALL=(root) NOPASSWD: /usr/local/bin/llm-engine h3, /usr/local/bin/llm-engine restore, /usr/local/bin/llm-engine probe

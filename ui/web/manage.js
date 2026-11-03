@@ -107,6 +107,7 @@
         <p class="muted small">Only one runs at a time — both need the whole GPU. Ollama: the everyday models, fastest
           overall. Strata Q2_0: the full 125B model. Strata Coder: the smaller coding variant. Loading can take
           1–3 minutes. Strata keeps the PC awake; switch to Ollama to allow idle sleep.</p>
+        <p class="mg-status" id="mg-eng-h3" hidden><span class="mg-dot warn"></span><span></span></p>
         <div class="mg-msg" id="mg-eng-msg"></div>
       </div>
       <div class="st-card">
@@ -412,6 +413,11 @@
       b.querySelector(".mg-dot").className = "mg-dot" + (on ? (e.state === "loading" || e.state === "error" ? " warn" : " on") : "");
       b.querySelector("span:last-child").textContent = on ? `${name} · ${ENG[e.state] || e.state}` : name;
     }
+    const h3 = $("mg-eng-h3");
+    h3.hidden = !(e && e.active === "h3");
+    if (!h3.hidden) h3.lastChild.textContent = e.state === "rendering"
+      ? "Video (H3) has the GPU and is rendering — switching now is refused until it is done (or cancel it on the Video tab)."
+      : "Video (H3) holds the GPU for quick follow-ups and gives it back by itself. Pick an engine to take it back now.";
     paintModels();
 
     // chat target: is the agent reachable?

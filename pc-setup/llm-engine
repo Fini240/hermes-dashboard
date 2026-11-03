@@ -2,6 +2,8 @@
 # Switch the GPU between Ollama and Strata, or report which one has it.
 #
 #   llm-engine ollama | strata    switch (prints "ok")
+#   llm-engine h3                 lend the GPU to the H3 video server (remembers who had it)
+#   llm-engine restore            give it back to that engine after the videos
 #   llm-engine probe              key=value lines for the dashboard's PROBE
 #
 # Lives on the PC, like rgb-apply, so the dashboard composes no service names
@@ -11,6 +13,18 @@ STRATA_DIR=${STRATA_DIR:-/home/user/Strata}
 STRATA_CFG=${STRATA_CFG:-$STRATA_DIR/strata-active.json}
 USER_NAME=user   # the account that owns Ollama's user unit
 UID_NUM=1000
+PREV=/run/llm-engine.prev   # who had the GPU before H3 borrowed it
+
+# A video render needs the whole card for minutes; never pull it away mid-render.
+h3_rendering() { pgrep -f "sd-cli -M vid_gen" >/dev/null; }
+refuse_if_rendering() {
+    if h3_rendering; then
+        echo "H3 is rendering a video - cancel it on the Video tab or wait until it is done" >&2
+        exit 1
+    fi
+}
+# An explicit engine choice ends H3's loan.
+end_h3_loan() { systemctl stop h3-awake.service 2>/dev/null || true; rm -f "$PREV"; }
 
 # Ollama runs as that account's user unit (see 10-ollama-gpu), not a system service.
 ollama_ctl() {
@@ -35,6 +49,8 @@ case "${1:-}" in
         # Serialize switches from multiple dashboards; accept only known variants.
         exec 9>/run/llm-engine.lock
         flock -w 90 9
+        refuse_if_rendering
+        end_h3_loan
         variant=${2:-}
         if [ -n "$variant" ]; then
             case "$variant" in q2_0|coder-iq1_m) ;; *) echo "unknown Strata model" >&2; exit 2 ;; esac
@@ -63,11 +79,47 @@ EOF
     ollama)
         exec 9>/run/llm-engine.lock
         flock -w 90 9
+        refuse_if_rendering
+        end_h3_loan
         systemctl stop strata.service
         ollama_ctl start ollama.service && echo ok
         ;;
+    h3)
+        exec 9>/run/llm-engine.lock
+        flock -w 90 9
+        if [ "$(systemctl is-active h3-awake.service 2>/dev/null)" != active ]; then
+            if [ "$(systemctl is-active strata.service 2>/dev/null)" = active ]; then
+                v=$(basename "$(readlink -f "$STRATA_CFG")" .json); v=${v#strata-}
+                echo "strata $v" > "$PREV"
+            elif [ "$(ollama_ctl is-active ollama.service 2>/dev/null)" = active ]; then
+                echo "ollama" > "$PREV"
+            else
+                echo "none" > "$PREV"
+            fi
+            systemctl stop strata.service
+            ollama_ctl stop ollama.service
+            systemctl start h3-awake.service
+        fi
+        echo ok
+        ;;
+    restore)
+        exec 9>/run/llm-engine.lock
+        flock -w 90 9
+        refuse_if_rendering
+        prev=$(cat "$PREV" 2>/dev/null || echo strata)
+        systemctl stop h3-awake.service 2>/dev/null || true
+        rm -f "$PREV"
+        flock -u 9
+        case "$prev" in
+            strata*) set -- $prev; exec "$0" strata ${2:-} ;;
+            ollama)  exec "$0" ollama ;;
+            *)       echo ok ;;
+        esac
+        ;;
     probe)
         echo "engine_avail=1"
+        echo "engine_h3=$(systemctl is-active h3-awake.service 2>/dev/null || true)"
+        h3_rendering && echo "h3_state=rendering"
         s=$(systemctl is-active strata.service 2>/dev/null || true)
         o=$(ollama_ctl is-active ollama.service 2>/dev/null || true)
         echo "engine_strata=$s"
@@ -104,7 +156,7 @@ else:
         fi
         ;;
     *)
-        echo "usage: llm-engine ollama|strata [q2_0|coder-iq1_m]|probe" >&2
+        echo "usage: llm-engine ollama|strata [q2_0|coder-iq1_m]|h3|restore|probe" >&2
         exit 2
         ;;
 esac

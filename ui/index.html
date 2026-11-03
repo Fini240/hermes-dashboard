@@ -32,6 +32,8 @@
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
+    <button class="st-tab" role="tab" id="tab-btn-video" aria-controls="view-video" aria-selected="false" data-tab="video">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-film"/></svg>Video</button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
     <button class="st-tab" role="tab" id="tab-btn-manage" aria-controls="view-manage" aria-selected="false" data-tab="manage">
@@ -194,6 +196,11 @@
     </div>
   </section>
 
+  <!-- ============================ Video (dashboard addition: H3 on the PC) ============================ -->
+  <section class="view view--video" id="view-video" role="tabpanel" aria-labelledby="tab-btn-video" hidden>
+    <div class="vid" id="vid"></div>
+  </section>
+
   <!-- ============================ Manage (dashboard addition) ============================ -->
   <section class="view view--manage" id="view-manage" role="tabpanel" aria-labelledby="tab-btn-manage" hidden>
     <div class="manage" id="manage"></div>
@@ -259,5 +266,6 @@
 <script src="web/builder.js"></script>
 <script src="web/mobile.js"></script>
 <script src="web/voice.js"></script>
+<script src="web/video.js"></script>
 </body>
 </html>

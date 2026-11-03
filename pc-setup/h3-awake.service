@@ -1,0 +1,7 @@
+[Unit]
+Description=Keep the PC awake while H3 (video) holds the GPU
+# Started by `llm-engine h3`, stopped by `llm-engine restore` or any explicit engine switch.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --who=h3 --why="H3 video holds the GPU" --mode=block sleep infinity
