@@ -44,6 +44,7 @@
 .vid-clip{padding:0!important;overflow:hidden;gap:0!important}
 .vid-media{position:relative;background:#000;aspect-ratio:var(--ar,16/9);display:flex;align-items:center;justify-content:center;max-height:70vh}
 .vid-media video,.vid-media img{width:100%;height:100%;object-fit:contain;display:block}
+.vid-media>a{display:block;width:100%;height:100%}
 .vid-wait{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:#e8e8e8;font-size:var(--st-fs-sm);padding:16px;text-align:center;background:#111}
 .vid-bar{width:min(320px,80%);height:6px;border-radius:3px;background:rgba(255,255,255,.15);overflow:hidden}
 .vid-bar i{display:block;height:100%;background:var(--st-accent);transition:width .6s linear}
@@ -69,6 +70,7 @@
     mode: store.get("vid.mode", "text"), size: store.get("vid.size", "medium"), aspect: store.get("vid.aspect", "landscape"),
     length: store.get("vid.length", "2.3"), quality: store.get("vid.quality", "standard"), encoder: store.get("vid.encoder", "stock"),
     seed: "", image: null, imageName: "",
+    kind: store.get("vid.kind", "video"), pmodel: store.get("vid.pmodel", "flux3"), paspect: store.get("vid.paspect", "square"),
   };
   // 03.11.: Standard replaced Fast as the default (4 steps morph fine detail). Move a remembered "fast" once.
   if (form.quality === "fast" && !store.get("vid.q-migrated", "")) { form.quality = "standard"; store.set("vid.quality", "standard"); }
@@ -112,9 +114,49 @@
   }
 
   // ---------------------------------------------------------------- render
+  const KINDS = [["video", "Video"], ["picture", "Picture"]];
+  const P_ASPECTS = [["square", "Square"], ["landscape", "Landscape"], ["portrait", "Portrait"]];
+  function renderPictureForm(root, keepPrompt) {
+    const pm = presets.pictures || {models: {}, sizes: {}};
+    const models = Object.entries(pm.models).map(([k, v]) => [k, `${v.label.replace(/ \(.*/, "")} · ~${mmss(v.secs)}`]);
+    const note = (pm.models[form.pmodel] || {}).label?.match(/\((.*)\)/)?.[1] || "";
+    const canEdit = !!(pm.models[form.pmodel] || {}).edit;
+    if (!canEdit) form.image = null;
+    root.innerHTML = `
+      <span class="card-title">New picture</span>
+      <div class="vid-field">${seg("vid-kind", KINDS, form.kind)}</div>
+      <div class="vid-field"><label class="vid-label" for="vid-prompt">Prompt</label>
+        <textarea id="vid-prompt" maxlength="4000" placeholder="A cozy bakery window at dusk with a hand-painted sign that says &quot;FINN BAKES&quot;, warm light, photorealistic">${esc(keepPrompt)}</textarea></div>
+      <div class="vid-field"><span class="vid-label">Model</span>${seg("vid-pmodel", models, form.pmodel)}
+        <p class="muted small">${esc(note)}</p></div>
+      <div class="vid-field"><span class="vid-label">Shape</span>${seg("vid-paspect", P_ASPECTS.map(([k, l]) => [k, `${l} ${(pm.sizes[k] || []).join("×")}`]), form.paspect)}</div>
+      <div class="vid-field" ${canEdit ? "" : "hidden"}>
+        <span class="vid-label">Change a picture (optional)</span>
+        <div class="vid-pic">${form.image ? `<img src="${form.image}" alt="">` : ""}
+          <button type="button" class="st-btn st-btn--secondary" id="vid-pick">${icon("image")}${form.image ? "Change" : "Choose a picture"}</button>
+          ${form.image ? `<button type="button" class="st-btn st-btn--icon" id="vid-unpick" title="Remove the picture" aria-label="Remove the picture">${icon("trash")}</button>` : ""}
+          <input type="file" id="vid-file" accept="image/png,image/jpeg,image/webp" hidden></div>
+        <p class="muted small">With a picture, the prompt says what to change (“make it winter”, “replace the sign text with …”).</p>
+      </div>
+      <details id="vid-adv" ${store.get("vid.adv", "") ? "open" : ""}><summary>More settings</summary>
+        <div class="vid-field"><label class="vid-label" for="vid-seed">Seed</label>
+          <input class="st-input" id="vid-seed" type="number" min="1" step="1" placeholder="Random" value="${esc(form.seed)}">
+          <span class="muted small">Same seed + same settings = the same picture.</span></div>
+      </details>
+      <div class="vid-go">
+        <button type="button" class="st-btn st-btn--primary" id="vid-go" ${sending ? "disabled" : ""}>${icon("image")}${sending ? "Sending…" : "Make picture"}</button>
+        <span class="vid-est" id="vid-est"></span>
+      </div>
+      <div class="vid-gpu" id="vid-gpu"></div>`;
+    wireForm();
+    paintEstimate();
+    paintGpu();
+  }
+
   function renderForm() {
     const root = $("vid-form");
     if (!root) return;
+    if (presets && form.kind === "picture") return renderPictureForm(root, $("vid-prompt")?.value ?? store.get("vid.prompt", ""));
     if (!presets) { root.innerHTML = `<span class="card-title">New video</span><p class="vid-empty">${esc(offline ? "The PC is asleep — wake it under Manage to make videos." : error || "Connecting to the video engine…")}</p>`; return; }
     const sizes = Object.keys(presets.sizes).map((k) => { const [w, h] = dims(k, form.aspect); return [k, `${k[0].toUpperCase() + k.slice(1)} ${w}×${h}`]; });
     const lengths = lengthKeys().map((k) => [k, `${k} s`]);
@@ -123,6 +165,7 @@
     const keepPrompt = $("vid-prompt")?.value ?? store.get("vid.prompt", "");
     root.innerHTML = `
       <span class="card-title">New video</span>
+      <div class="vid-field">${seg("vid-kind", KINDS, form.kind)}</div>
       <div class="vid-field">${seg("vid-mode", MODES, form.mode)}<p class="muted small">${esc(MODE_NOTE[form.mode])}</p></div>
       <div class="vid-field" id="vid-picrow" ${form.mode === "text" ? "hidden" : ""}>
         <span class="vid-label">Picture</span>
@@ -161,6 +204,12 @@
   function paintEstimate() {
     const el = $("vid-est");
     if (!el || !presets) return;
+    if (form.kind === "picture") {
+      const m = (presets.pictures?.models || {})[form.pmodel] || {secs: 60};
+      const [pw, ph] = presets.pictures?.sizes?.[form.paspect] || [1024, 1024];
+      el.textContent = `${pw}×${ph} · about ${mmss(m.secs * pw * ph / (1024 * 1024) + (form.image ? 20 : 0))}`;
+      return;
+    }
     const [w, h] = dims(form.size, form.aspect);
     const ahead = jobs.filter((j) => j.status === "queued" || j.status === "running").length;
     el.textContent = `${w}×${h} · ${form.length} s · about ${mmss(estimate())}` + (ahead ? ` after the ${ahead} before it` : "");
@@ -184,7 +233,10 @@
     const ar = `${j.width}/${j.height}`;
     const files = `api/video/files/${encodeURIComponent(j.id)}`;
     let media;
-    if (j.status === "done") {
+    const pic = j.kind === "picture";
+    if (j.status === "done" && pic) {
+      media = `<a href="${files}/image.png" target="_blank" rel="noopener"><img src="${files}/poster.jpg" alt="" loading="lazy"></a>`;
+    } else if (j.status === "done") {
       media = `<video controls playsinline preload="none" poster="${files}/poster.jpg" src="${files}/video.mp4"></video>`;
     } else {
       const pos = jobs.filter((x) => x.status === "queued" && x.created < j.created).length;
@@ -193,7 +245,9 @@
         : j.status === "cancelled" ? "Cancelled" : "Failed";
       media = `<div class="vid-wait">${j.status === "running" ? `<div class="vid-bar"><i style="width:${Math.round((j.progress || 0) * 100)}%"></i></div>` : ""}<span>${msg}</span></div>`;
     }
-    const meta = [`${j.width}×${j.height}`, `${j.seconds} s`, (presets?.quality?.[j.quality]?.label || j.quality).replace(/ \(.*/, ""),
+    const meta = pic ? [`${j.width}×${j.height}`, ((presets?.pictures?.models || {})[j.model]?.label || j.model).replace(/ \(.*/, ""),
+      j.mode === "edit" ? "edited picture" : "", `seed ${j.seed}`, j.status === "done" && j.elapsed ? `made in ${mmss(j.elapsed)}` : "", ago(j.created)].filter(Boolean)
+      : [`${j.width}×${j.height}`, `${j.seconds} s`, (presets?.quality?.[j.quality]?.label || j.quality).replace(/ \(.*/, ""),
       j.mode === "image" ? "from picture" : j.mode === "ref" ? "reference" : "", j.encoder === "uncensored" ? "uncensored" : "",
       `seed ${j.seed}`, j.status === "done" && j.elapsed ? `made in ${mmss(j.elapsed)}` : "", ago(j.created)].filter(Boolean);
     const busy = j.status === "queued" || j.status === "running";
@@ -204,7 +258,9 @@
         <div class="vid-meta">${meta.map((m) => `<span>${esc(m)}</span>`).join("")}</div>
         ${j.status === "failed" ? `<div class="vid-err">${esc(j.error || "Failed")}</div>` : ""}
         <div class="vid-acts">
-          ${j.status === "done" ? `<a class="st-btn st-btn--secondary" href="${files}/video.mp4" download="h3-${esc(j.id)}.mp4">${icon("download")}Download</a>` : ""}
+          ${j.status === "done" ? (pic ? `<a class="st-btn st-btn--secondary" href="${files}/image.png" download="picture-${esc(j.id)}.png">${icon("download")}Download</a>`
+            : `<a class="st-btn st-btn--secondary" href="${files}/video.mp4" download="h3-${esc(j.id)}.mp4">${icon("download")}Download</a>`) : ""}
+          ${j.status === "done" && pic ? `<button type="button" class="st-btn st-btn--secondary" data-act="animate">${icon("film")}Animate</button>` : ""}
           <button type="button" class="st-btn st-btn--secondary" data-act="reuse">${icon("refresh")}Use these settings</button>
           <button type="button" class="st-btn st-btn--secondary" data-act="del">${icon(busy ? "stop" : "trash")}${busy ? "Cancel" : "Delete"}</button>
         </div>
@@ -277,10 +333,13 @@
     pick("vid-size", "size", fitLength);
     pick("vid-length", "length");
     pick("vid-encoder", "encoder");
+    pick("vid-kind", "kind");
+    pick("vid-pmodel", "pmodel");
+    pick("vid-paspect", "paspect");
     $("vid-prompt").oninput = (ev) => { store.set("vid.prompt", ev.target.value); };
     $("vid-prompt").onkeydown = (ev) => { if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) submit(); };
     $("vid-seed").oninput = (ev) => { form.seed = ev.target.value; };
-    $("vid-adv").ontoggle = (ev) => store.set("vid.adv", ev.target.open ? "1" : "");
+    if ($("vid-adv")) $("vid-adv").ontoggle = (ev) => store.set("vid.adv", ev.target.open ? "1" : "");
     $("vid-go").onclick = submit;
     if ($("vid-pick")) {
       $("vid-pick").onclick = () => $("vid-file").click();
@@ -308,15 +367,18 @@
     if (sending || !presets) return;
     const prompt = $("vid-prompt").value.trim();
     if (!prompt) { $("vid-prompt").focus(); return say("warn", "Write a prompt first"); }
-    if (form.mode !== "text" && !form.image) return say("warn", "Choose a picture", form.mode === "ref" ? "Reference mode needs one." : "Start-picture mode needs one.");
+    if (form.kind === "video" && form.mode !== "text" && !form.image) return say("warn", "Choose a picture", form.mode === "ref" ? "Reference mode needs one." : "Start-picture mode needs one.");
     sending = true; renderForm();
     try {
-      const j = await api("POST", "jobs", {prompt, mode: form.mode, image: form.mode === "text" ? undefined : form.image,
+      const j = form.kind === "picture"
+        ? await api("POST", "jobs", {kind: "picture", prompt, model: form.pmodel, aspect: form.paspect,
+                                     image: form.image || undefined, seed: form.seed ? +form.seed : undefined})
+        : await api("POST", "jobs", {prompt, mode: form.mode, image: form.mode === "text" ? undefined : form.image,
         size: form.size, aspect: form.aspect, length: form.length, quality: form.quality, encoder: form.encoder,
         seed: form.seed ? +form.seed : undefined});
       seen[j.id] = j.status;
       jobs.unshift(j);
-      say("success", "Video queued", `About ${mmss(j.estimate_s)}. You can leave this page — it keeps going on the PC.`);
+      say("success", j.kind === "picture" ? "Picture queued" : "Video queued", `About ${mmss(j.estimate_s)}. You can leave this page — it keeps going on the PC.`);
     } catch (e) { say("error", "Could not start the video", e.message); }
     finally { sending = false; renderForm(); refresh(); }
   }
@@ -329,7 +391,32 @@
     const id = b.closest(".vid-clip").dataset.id;
     const j = jobs.find((x) => x.id === id);
     if (!j) return;
+    if (b.dataset.act === "animate" || (b.dataset.act === "reuse" && j.kind === "picture")) {
+      const animate = b.dataset.act === "animate";
+      try {
+        const blob = await (await fetch(`api/video/files/${encodeURIComponent(j.id)}/${animate ? "image.png" : "input.png"}`)).blob();
+        form.image = (animate || j.has_input) ? await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(blob); }) : null;
+      } catch (e) { form.image = null; }
+      if (animate) {             // the picture becomes the first frame of a video
+        Object.assign(form, {kind: "video", mode: "image", aspect: j.aspect === "portrait" ? "portrait" : j.aspect === "square" ? "square" : "landscape", seed: ""});
+        store.set("vid.kind", "video"); store.set("vid.mode", "image"); store.set("vid.aspect", form.aspect);
+        if ($("vid-prompt")) $("vid-prompt").value = "";
+        store.set("vid.prompt", "");
+        say("info", "Picture ready as the first frame", "Describe the motion and the sound, then Make video.");
+      } else {
+        Object.assign(form, {kind: "picture", pmodel: j.model, paspect: j.aspect, seed: String(j.seed)});
+        for (const k of ["kind", "pmodel", "paspect"]) store.set("vid." + k, form[k]);
+        store.set("vid.prompt", j.prompt);
+        if ($("vid-prompt")) $("vid-prompt").value = j.prompt;
+        say("info", "Settings copied", "Same seed — change the prompt or the seed for a variation.");
+      }
+      renderForm();
+      $("vid-form").scrollIntoView({behavior: "smooth", block: "start"});
+      return;
+    }
     if (b.dataset.act === "reuse") {
+      Object.assign(form, {kind: "video"});
+      store.set("vid.kind", "video");
       Object.assign(form, {mode: j.mode, size: j.size, aspect: j.aspect, length: j.length, quality: j.quality, encoder: j.encoder, seed: String(j.seed)});
       for (const k of ["mode", "size", "aspect", "length", "quality", "encoder"]) store.set("vid." + k, form[k]);
       store.set("vid.prompt", j.prompt);

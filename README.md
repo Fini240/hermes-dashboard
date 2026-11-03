@@ -91,10 +91,11 @@ instead of drifting across forked copies. See `.env.example` for the annotated l
 | `HERMES_STATE_SYNC_SECONDS` | Token sync interval (default 15) |
 | `HERMES_H3_URL` / `HERMES_H3_KEY` | h3-engine on the PC for the Video tab; blank = the tab says it is not configured |
 
-## Video (MiniMax H3)
+## Studio: video (MiniMax H3) and pictures
 
-The Video tab makes short clips **with sound** on the PC: text, a start picture, or a reference
-picture. The work happens in **h3-engine**, a small job server on the PC (stable-diffusion.cpp's
+The Studio tab makes short clips **with sound** on the PC (text, a start picture, or a reference
+picture) and **pictures** (FLUX 3 Klein, Qwen-Image 2.1, Chroma1-HD; FLUX can also edit a picture).
+A finished picture can be animated: it becomes the first frame of a new video. The work happens in **h3-engine**, a small job server on the PC (stable-diffusion.cpp's
 `sd-cli` + ffmpeg). This dashboard only proxies `/api/video/*` and adds the key; clips stream with
 Range support so Safari/iPhone can play them.
 
