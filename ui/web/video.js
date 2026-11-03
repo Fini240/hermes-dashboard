@@ -67,9 +67,12 @@
   // ---------------------------------------------------------------- form state (remembered per browser)
   const form = {
     mode: store.get("vid.mode", "text"), size: store.get("vid.size", "medium"), aspect: store.get("vid.aspect", "landscape"),
-    length: store.get("vid.length", "2.3"), quality: store.get("vid.quality", "fast"), encoder: store.get("vid.encoder", "stock"),
+    length: store.get("vid.length", "2.3"), quality: store.get("vid.quality", "standard"), encoder: store.get("vid.encoder", "stock"),
     seed: "", image: null, imageName: "",
   };
+  // 03.11.: Standard replaced Fast as the default (4 steps morph fine detail). Move a remembered "fast" once.
+  if (form.quality === "fast" && !store.get("vid.q-migrated", "")) { form.quality = "standard"; store.set("vid.quality", "standard"); }
+  store.set("vid.q-migrated", "1");
   let presets = null, jobs = [], health = null, offline = false, error = "", shown = false, timer = 0, sending = false;
   const seen = {};      // job id -> last status, to announce finished clips
 
@@ -130,7 +133,8 @@
       </div>
       <div class="vid-field"><label class="vid-label" for="vid-prompt">Prompt</label>
         <textarea id="vid-prompt" maxlength="4000" placeholder="A red fox trots through falling snow at dusk, cinematic. Soft crunching footsteps and wind.">${esc(keepPrompt)}</textarea></div>
-      <div class="vid-field"><span class="vid-label">Quality</span>${seg("vid-quality", quals, form.quality)}</div>
+      <div class="vid-field"><span class="vid-label">Quality</span>${seg("vid-quality", quals, form.quality)}
+        ${form.quality === "fast" ? `<p class="muted small">Draft: a quick look at the idea. Fine details like text, faces or small figures can change from frame to frame.</p>` : ""}</div>
       <div class="vid-field"><span class="vid-label">Shape</span>${seg("vid-aspect", ASPECTS, form.aspect)}</div>
       <div class="vid-field"><span class="vid-label">Size</span>${seg("vid-size", sizes, form.size)}</div>
       <div class="vid-field"><span class="vid-label">Length</span>${seg("vid-length", lengths, form.length, (v) => presets.lengths[v] > maxFrames(form.size))}</div>
