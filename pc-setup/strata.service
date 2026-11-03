@@ -24,7 +24,7 @@ Environment=STRATA_DIR=/home/user/Strata
 Environment=DASHBOARD_URL=http://192.168.1.60:8765/
 ExecStartPre=/usr/local/bin/strata-page redirect
 ExecStopPost=/usr/local/bin/strata-page restore
-ExecStart=/home/user/Strata/.venv/bin/python serve/server.py --engine strata --config strata-coder-iq1_m.json --port 8080
+ExecStart=/home/user/Strata/.venv/bin/python serve/server.py --engine strata --config strata-active.json --port 8080
 # The engine is a child of the Python server; stop the whole group so no orphan
 # keeps holding ~6 GB of VRAM and 25 GB of RAM.
 KillMode=control-group

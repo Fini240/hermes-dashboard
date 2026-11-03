@@ -81,7 +81,7 @@
       if (g !== last) { h += `<div class="chat-side__group">${g}</div>`; last = g; }
       h += `<div class="chat-item${c.id === current ? " on" : ""}" data-id="${esc(c.id)}">
         <button class="chat-item__open" data-open="${esc(c.id)}"><span class="chat-item__title">${esc(c.title)}</span>
-          <span class="chat-item__meta">${c.target === "agent" ? "Agent · " : ""}${when(c.updated)}</span></button>
+          <span class="chat-item__meta">${c.target === "agent" ? "Agent · " : c.target === "builder" ? `Builder${c.project ? " · " + esc(c.project) : ""} · ` : ""}${when(c.updated)}</span></button>
         <button class="st-btn st-btn--icon chat-item__act" data-rename="${esc(c.id)}" aria-label="Rename" title="Rename">
           <svg class="st-icon st-icon--sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>
         <button class="st-btn st-btn--icon chat-item__act" data-del="${esc(c.id)}" aria-label="Delete" title="Delete">${icon("trash", "st-icon st-icon--sm")}</button></div>`;
@@ -98,8 +98,15 @@
 
   // ---------------------------------------------------------------- open / new / rename / delete
   function stillBusy() {
+    // a Builder run lives on the PC: leaving the chat only stops watching it
+    if (typeof busy !== "undefined" && busy && busy.builder && window.dashBuilder) { window.dashBuilder.detach(); return false; }
     if (typeof busy !== "undefined" && busy) { toast("warn", "Still writing", "Stop the answer first."); return true; }
     return false;
+  }
+  function restore(c) {       // who an opened chat talked to, and its Builder session
+    if (c.target && window.dashSetTarget) window.dashSetTarget(c.target);
+    if (c.model && window.dashSetModel) window.dashSetModel(c.model);
+    if (window.dashBuilder) window.dashBuilder.set(c.target === "builder" ? c.builder : null);
   }
   function show(msgs, id) {
     current = id; ls.set("dash.chat-id", id);
@@ -115,15 +122,17 @@
     try {
       const c = await api("GET", `/api/chats/${encodeURIComponent(id)}`);
       show(c.messages || [], id);
-      if (c.target && window.dashSetTarget) window.dashSetTarget(c.target);
+      restore(c);
     } catch (e) { toast("error", "Could not open that chat", e.message); }
   }
   function newChat() {
     if (stillBusy()) return;
     openSide(false);
+    if (window.dashBuilder) window.dashBuilder.set(null);
     show([], newId());       // saved on its first message, so empty chats never pile up
-    $("input") && $("input").focus();
+    focusInput();
   }
+  window.dashNewChat = newChat;
   async function rename(id) {
     const c = list.find((x) => x.id === id);
     const t = prompt("Rename chat", c ? c.title : "");
@@ -136,7 +145,7 @@
     if (!confirm(`Delete "${c ? c.title : "this chat"}"?`)) return;
     try {
       await api("DELETE", `/api/chats/${encodeURIComponent(id)}`);
-      if (id === current) show([], newId());
+      if (id === current) { if (window.dashBuilder) window.dashBuilder.set(null); show([], newId()); }
       await refresh();
     } catch (e) { toast("error", "Delete failed", e.message); }
   }
@@ -156,7 +165,8 @@
                                          files: (m.files || []).map((f) => ({name: f.name}))}));
     try {
       await api("PUT", `/api/chats/${encodeURIComponent(current)}`,
-                {messages: strip, target: ls.get("dash.chat-target", "model")});
+                {messages: strip, target: ls.get("dash.chat-target", "model"), model: window.dashGetModel ? window.dashGetModel() : "",
+                 builder: window.dashBuilder ? window.dashBuilder.get() : null});
       await refresh();
     } catch (e) { /* offline: the browser copy still has it */ }
   }
@@ -168,7 +178,11 @@
     if (offline) return;
     if (current && list.some((c) => c.id === current)) {
       const c = await api("GET", `/api/chats/${encodeURIComponent(current)}`).catch(() => null);
-      if (c) { messages = c.messages || []; origSave(); renderChat(); paintList(); return; }
+      if (c) {
+        messages = c.messages || []; origSave(); renderChat(); paintList();
+        restore(c);
+        return;
+      }
     }
     // The chat Strata's page had in this browser before the history existed becomes the first entry.
     if (messages.length) { current = newId(); ls.set("dash.chat-id", current); await sync(); return; }

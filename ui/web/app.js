@@ -77,7 +77,7 @@ function showTab(name) {
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   for (const v of ["chat", "monitor", "about", "manage"]) $(`view-${v}`).hidden = v !== tab;
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
-  if (tab === "chat") $("input").focus();
+  if (tab === "chat") focusInput();
   if (tab === "monitor") loadMcp();
   if (tab === "about") loadConfig();
   if (window.manageShown) window.manageShown(tab);
@@ -600,6 +600,8 @@ function msgEl(m, i) {
     const meta = document.createElement("div");
     meta.className = "st-msg__meta";
     meta.textContent = `You · ${timeStr(m.time)}`;
+    if (m.text) meta.insertAdjacentHTML("beforeend",
+      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the prompt" title="Copy">${icon("copy")}</button>`);
     el.appendChild(meta);
   } else {
     el.innerHTML = `<details class="st-collapse think" hidden><summary>${icon("thinking", "st-icon st-icon--sm")}<span class="think-title"></span>` +
@@ -693,7 +695,20 @@ function renderChat() {
   scrollDown(true);
 }
 function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
-function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
+function followsChat() { return window.dashChatPinned ? window.dashChatPinned() : nearBottom(); }
+function scrollDown(force) {
+  const s = $("chat-scroll");
+  if (force || followsChat()) {
+    if (window.dashChatPin) window.dashChatPin();
+    s.scrollTop = s.scrollHeight;
+  }
+}
+
+function focusInput() {
+  // A phone should open its keyboard only when the user taps the editor.
+  if (innerWidth > 640 && matchMedia("(hover: hover) and (pointer: fine)").matches)
+    $("input").focus({preventScroll: true});
+}
 
 $("chat").addEventListener("click", (e) => {
   const cc = e.target.closest("[data-code-copy]");
@@ -755,8 +770,10 @@ function assistantMessages(m) {
 
 function setBusy(on) {
   $("stop-btn").hidden = !on;
+  $("send-btn").hidden = on;
   $("send-btn").disabled = on;
   $("composer-hint").textContent = on ? "" : "Shift+Enter: new line";
+  if (window.dashModelBusy) window.dashModelBusy();
 }
 
 async function send() {
@@ -789,7 +806,7 @@ async function send() {
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
-  const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
+  const paint = () => { frame = 0; const pinned = followsChat(); updateAssistant(el, m, true); scrollDown(pinned); };
   try {
     const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
                                                    signal: controller.signal});
@@ -854,9 +871,10 @@ async function send() {
   busy = null;
   setBusy(false);
   if (frame) cancelAnimationFrame(frame);
+  const pinned = followsChat();
   updateAssistant(el, m, false);
   saveChat();
-  scrollDown();
+  scrollDown(pinned);
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
@@ -864,7 +882,11 @@ $("stop-btn").onclick = () => { if (busy) busy.controller.abort(); };
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
 });
-function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, innerHeight * 0.4)}px`; }
+function autosize() {
+  const t = $("input"), height = window.visualViewport?.height || innerHeight;
+  t.style.height = "auto";
+  t.style.height = `${Math.min(t.scrollHeight, Math.max(40, height * (innerWidth <= 640 ? 0.3 : 0.4)))}px`;
+}
 $("input").addEventListener("input", autosize);
 
 $("new-btn").onclick = () => {
@@ -961,7 +983,7 @@ for (const id of ["chat", "composer"]) {
     if (!e.dataTransfer || !e.dataTransfer.files.length) return;
     e.preventDefault();
     addFiles(e.dataTransfer.files);
-    $("input").focus();
+    focusInput();
   });
 }
 $("file").onchange = () => { addFiles($("file").files); $("file").value = ""; };

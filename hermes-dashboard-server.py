@@ -430,9 +430,18 @@ def rgb_auto_action(on):
 
 
 ENGINES = ("ollama", "strata")
+STRATA_MODELS = {
+    "qwen3.8-flash-next-q2_0": {"variant": "q2_0", "label": "Strata Q2_0", "probe": "strata_installed_q2_0"},
+    "qwen3.8-flash-next-coder-iq1_m": {"variant": "coder-iq1_m", "label": "Strata Coder IQ1_M", "probe": "strata_installed_coder_iq1_m"},
+}
 
 
-def engine_action(engine):
+def strata_models(pc):
+    return [{"id": name, "object": "model", "engine": "strata", "label": model["label"]}
+            for name, model in STRATA_MODELS.items() if (pc or {}).get(model["probe"]) == "1"]
+
+
+def engine_action(engine, model=""):
     """Hand the GPU to Ollama or to Strata.
 
     Both need the whole card, so exactly one runs. `llm-engine` on the PC does
@@ -442,11 +451,13 @@ def engine_action(engine):
     """
     if engine not in ENGINES:
         return False, "unknown engine"
+    if not isinstance(model, str) or (model and (engine != "strata" or model not in STRATA_MODELS)):
+        return False, "unknown Strata model"
     if pc_os() == "windows":
         return False, "the engine switch is Linux-only"
     try:
         r = subprocess.run(["ssh", *SSH_OPTS, "root@" + HOST,
-                            "/usr/local/bin/llm-engine " + engine],
+                            "/usr/local/bin/llm-engine " + engine + (" " + STRATA_MODELS[model]["variant"] if model else "")],
                            capture_output=True, text=True, timeout=90)
         if r.returncode == 0 and "ok" in r.stdout:
             return True, ("Strata is loading — about 80 s until it answers"
@@ -809,7 +820,8 @@ def poller():
         if pc and pc.get("engine_avail") == "1":
             if pc.get("engine_strata") in ("active", "activating"):
                 engine = {"active": "strata",
-                          "state": pc.get("strata_state") or "loading"}
+                          "state": pc.get("strata_state") or "loading",
+                          "model": pc.get("strata_model") or "strata"}
                 try:
                     tps = float(pc.get("strata_tok_s") or 0)
                 except ValueError:
@@ -845,6 +857,8 @@ def poller():
                 "online": pc is not None or oll is not None,
                 "monitors": monitors,
                 "engine": engine,
+                "strata_models": strata_models(pc),
+                "strata_default": (pc or {}).get("strata_model") or "strata",
                 "strata": strata,
                 # Strata's own page, linked from the header while it runs.
                 # The key is deliberately not passed to the browser.
@@ -973,7 +987,12 @@ STRATA_PATHS = ("health", "api/health", "metrics", "status", "config", "settings
 # Paths that run the model, run tools or change settings: tailnet devices only.
 # The dashboard is also reachable from the home Wi-Fi with no login, and the
 # Hermes agent behind the chat has a terminal on the Mac.
-CONTROL_PATHS = ("v1/", "config", "settings", "load", "unload", "mcp", "api/chats")
+CONTROL_PATHS = ("v1/", "config", "settings", "load", "unload", "mcp", "api/chats", "api/builder")
+
+# strata-agent ("Builder" in the chat): Finn's own coding agent on the PC. The page talks to it through
+# /api/builder/* and this server adds the key, so the key never reaches a browser.
+BUILDER_URL = os.environ.get("HERMES_BUILDER_URL", "").rstrip("/")
+BUILDER_KEY = os.environ.get("HERMES_BUILDER_KEY", "")
 
 # The Hermes agent's OpenAI-compatible API server (gateway platform api_server).
 AGENT_URL = os.environ.get("HERMES_AGENT_URL", "").rstrip("/")
@@ -983,6 +1002,37 @@ AGENT_PROVIDER_STRATA = os.environ.get("HERMES_AGENT_PROVIDER_STRATA", "custom:s
 AGENT_PROVIDER_OLLAMA = os.environ.get("HERMES_AGENT_PROVIDER_OLLAMA", "custom:pc-ollama")
 # The Ollama model a chat gets when none is resident.
 OLLAMA_CHAT_MODEL = os.environ.get("HERMES_OLLAMA_CHAT_MODEL", "qwen3.5:9b")
+# Added to plain-model chats that may use Strata's web tools (see _chat).
+RESEARCH_NOTE = ("You can search the web with the search and fetch_content tools. Search, then read only the 2-4 most "
+                 "relevant pages. Shops and big sites often block page reads (403/404): then use what the search "
+                 "results already say instead of trying more pages. Stop using tools after about 6 calls and always "
+                 "finish with a written answer that names your sources (with links).")
+
+# Put in front of every plain-model chat: without it Strata's Qwen model introduced itself as
+# Claude and denied it could see pictures. Kept short and fixed per day so Strata's prompt
+# cache still hits on every turn.
+IDENTITY_NOTE = ("You are {model}, an open-weights language model running locally on Finn's own PC "
+                 "({pc}) and reached through his private web dashboard. You are not Claude, ChatGPT or any "
+                 "cloud assistant, and nothing leaves this PC. Today is {date}. {pictures} You have no memory "
+                 "between chats and cannot run code or touch files; for that Finn uses the dashboard's Agent "
+                 "chat. Answer in the language Finn writes in (usually German or English).")
+STRATA_LABEL = "Qwen3.8-Flash-Next (a 125B mixture-of-experts model) served by the Strata engine"
+
+
+def system_note(model, pictures, research):
+    note = IDENTITY_NOTE.format(
+        model=model, pc=PC_NAME, date=time.strftime("%A, %d %B %Y"),
+        pictures="You can see pictures Finn attaches." if pictures else "You cannot see pictures in this setup.")
+    return note + ("\n\n" + RESEARCH_NOTE if research else "")
+
+
+def with_system(body, note):
+    """The dashboard's note first; drop a copy of an earlier note so a resent chat doesn't stack them."""
+    msgs = [m for m in body.get("messages") or [] if not (m.get("role") == "system" and (
+        m.get("content") == RESEARCH_NOTE or str(m.get("content", "")).startswith("You are ")))]
+    body["messages"] = [{"role": "system", "content": note}] + msgs
+
+
 # Strata-only request fields other servers would reject or ignore.
 STRATA_ONLY_FIELDS = ("strata_mcp", "experimental_speed_projection")
 
@@ -1016,7 +1066,8 @@ def chats_list():
             except (OSError, ValueError):
                 continue
             out.append({"id": c.get("id"), "title": c.get("title") or "New chat", "updated": c.get("updated", 0),
-                        "target": c.get("target"), "count": len(c.get("messages") or [])})
+                        "target": c.get("target"), "count": len(c.get("messages") or []),
+                        "project": (c.get("builder") or {}).get("project")})
     return sorted(out, key=lambda c: c["updated"], reverse=True)
 
 
@@ -1044,7 +1095,7 @@ def chat_put(cid, data):
                 cur = {}
         cur["id"] = cid
         cur.setdefault("created", time.time())
-        for k in ("messages", "target"):
+        for k in ("messages", "target", "model", "builder"):
             if k in data:
                 cur[k] = data[k]
         if data.get("title"):
@@ -1070,6 +1121,13 @@ def chat_delete(cid):
             os.remove(p)
             return True
     return False
+
+
+# strata-voice server (https, because browsers only give a page the microphone over https), e.g.
+# https://<pc>.<tailnet>.ts.net/ - the dashboard must then also be opened over https (tailscale serve).
+VOICE_URL = os.environ.get("HERMES_VOICE_URL", "").rstrip("/")
+# This dashboard's own https address (tailscale serve). Set = tailnet visitors on http are sent there.
+HTTPS_URL = os.environ.get("HERMES_HTTPS_URL", "").rstrip("/")
 
 
 def _tailnet(ip):
@@ -1098,6 +1156,28 @@ def ollama_model(s):
     """The resident Ollama model, else the configured default."""
     m = s.get("ollama") or []
     return m[0]["name"] if m else OLLAMA_CHAT_MODEL
+
+
+def installed_models(s):
+    """Installed models for the engine holding the GPU, including unloaded Ollama models."""
+    engine = (s.get("engine") or {}).get("active")
+    if not s.get("online"):
+        raise ValueError("%s is asleep — wake it under Manage." % PC_NAME)
+    if engine == "strata":
+        model = (s.get("engine") or {}).get("model") or (s.get("strata") or {}).get("model") or "strata"
+        return {"engine": engine, "default": model,
+                "data": s.get("strata_models") or [{"id": model, "object": "model", "label": model if model != "strata" else "Strata 125B"}],
+                "strata_models": s.get("strata_models") or [], "state": (s.get("engine") or {}).get("state")}
+    if engine != "ollama":
+        raise ValueError("No model engine is ready. Choose one under Manage.")
+    with urllib.request.urlopen(OLLAMA + "/api/tags", timeout=6) as r:
+        models = json.load(r).get("models", [])
+    data = [{"id": m["name"], "object": "model",
+             "params": (m.get("details") or {}).get("parameter_size"),
+             "size": m.get("size")} for m in models if m.get("name")]
+    data.sort(key=lambda m: m["id"].lower())
+    return {"engine": engine, "default": ollama_model(s), "data": data,
+            "strata_models": s.get("strata_models") or [], "state": (s.get("engine") or {}).get("state")}
 
 
 def synth_health(s):
@@ -1160,7 +1240,60 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return default
 
-    def _proxy(self, url, method, body=None, key="", stream=False, timeout=30):
+    def _hermes_events(self, r):
+        """Relay the Hermes agent's SSE, turning its tool events into the page's tool blocks.
+
+        Hermes announces each tool as `event: hermes.tool.progress` + `data: {tool, emoji,
+        label, toolCallId, status}`. Strata's page already draws tool calls from a chunk's
+        `strata_mcp` field (call -> running, result -> done), so each Hermes event is
+        re-emitted in that shape; everything else passes through untouched.
+        """
+        started, buf, event = {}, b"", None
+        while True:
+            chunk = r.read1(65536)
+            if not chunk:
+                break
+            buf += chunk
+            out = []
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                text = line.decode("utf-8", "replace")
+                if text.startswith("event:"):
+                    event = text[6:].strip()
+                    continue                          # re-emitted below as a plain data line
+                if event == "hermes.tool.progress" and text.startswith("data:"):
+                    event = None
+                    try:
+                        x = json.loads(text[5:])
+                    except ValueError:
+                        continue
+                    cid = x.get("toolCallId") or x.get("tool") or "tool"
+                    name = x.get("tool") or "tool"
+                    if x.get("status") == "running":
+                        started[cid] = (time.time(), x.get("label") or "")
+                        mcp = {"event": "call", "id": cid, "name": name, "server": "Hermes",
+                               "tool": ((x.get("emoji") or "") + " " + name).strip(),
+                               "arguments": {"what": x.get("label") or ""}}
+                    else:
+                        ok = x.get("status") in ("completed", "done", "ok", "success")
+                        t0, label = started.pop(cid, (time.time(), ""))
+                        # the block's one-line preview: what the tool worked on (Hermes sends no result)
+                        mcp = {"event": "result", "id": cid, "ok": ok, "ms": int((time.time() - t0) * 1000),
+                               "text": label if ok else (x.get("error") or x.get("status") or "failed")}
+                    out.append(b"data: " + json.dumps({"strata_mcp": mcp}).encode() + b"\n")
+                    continue
+                if event and text.startswith("data:"):
+                    event = None                      # other hermes.* events: not drawn
+                    continue
+                out.append(line + b"\n")
+            if out:
+                self.wfile.write(b"".join(out))
+                self.wfile.flush()
+        if buf:
+            self.wfile.write(buf)
+            self.wfile.flush()
+
+    def _proxy(self, url, method, body=None, key="", stream=False, timeout=30, hermes=False):
         """Forward to url; stream=True relays an SSE answer chunk by chunk."""
         req = urllib.request.Request(url, data=body, method=method)
         req.add_header("Content-Type", "application/json")
@@ -1184,6 +1317,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             try:
+                if hermes:
+                    return self._hermes_events(r)
                 while True:
                     chunk = r.read1(65536)
                     if not chunk:
@@ -1193,6 +1328,22 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass      # the page pressed Stop: dropping the upstream ends the run there too
 
+    def _builder(self, method, path, query, raw):
+        """/api/builder/<x> -> strata-agent's /api/<x> (health -> /health). Event streams are relayed live."""
+        if not BUILDER_URL:
+            return self._err(503, "Builder is not configured on this dashboard (HERMES_BUILDER_URL).")
+        rest = path[len("api/builder/"):]
+        if ".." in rest or not all(c.isalnum() or c in "-_/" for c in rest):
+            return self._err(400, "bad path")
+        if rest == "health":
+            if not _snap().get("online"):
+                return self._err(503, "%s is asleep — wake it under Manage." % PC_NAME)
+            return self._proxy(BUILDER_URL + "/health", "GET", None, "", timeout=5)
+        stream = method == "GET" and rest.endswith("/events")
+        url = BUILDER_URL + "/api/" + rest + (("?" + query) if query else "")
+        return self._proxy(url, method, raw if method == "POST" else None, BUILDER_KEY, stream,
+                           timeout=3600 if stream else 30)
+
     def _chat(self, raw):
         """POST v1/chat/completions from the page: the model on the PC, or the Hermes agent."""
         s = _snap()
@@ -1200,15 +1351,35 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw or b"{}")
         except ValueError:
             return self._err(400, "bad JSON")
+        if not isinstance(body, dict):
+            return self._err(400, "Chat request must be a JSON object.")
         for k in STRATA_ONLY_FIELDS:
             if not strata_up(s):
                 body.pop(k, None)
         stream = bool(body.get("stream"))
         e = s.get("engine") or {}
+        selected = self.headers.get("X-Chat-Model")
+        if not selected and isinstance(body.get("model"), str) and body["model"] in STRATA_MODELS:
+            selected = body["model"]
+        selected_engine = self.headers.get("X-Chat-Engine")
+        if selected and s.get("online") and selected_engine and selected_engine != e.get("active"):
+            return self._err(409, "The engine changed. Refresh the model picker and send again.")
+        if selected and e.get("active") == "strata" and selected not in ("strata", e.get("model") or "strata"):
+            return self._err(409, "A different Strata model is active. Refresh the model picker and send again.")
+        if s.get("online") and e.get("active") == "ollama":
+            selected = selected or body.get("model") or ollama_model(s)
+            try:
+                available = installed_models(s)
+            except Exception:
+                return self._err(503, "Could not read installed Ollama models. Try again when Ollama is ready.")
+            if selected not in [m["id"] for m in available["data"]]:
+                return self._err(400, "That model is not installed. Refresh the model picker and choose an installed model.")
         if (self.headers.get("X-Chat-Target") or "model") == "agent":
             if not AGENT_URL:
                 return self._err(503, "The Hermes agent is not configured on this dashboard (HERMES_AGENT_URL).")
-            for k in STRATA_ONLY_FIELDS + ("seed", "top_k"):
+            # reasoning_effort too: the page sends its own (Strata's default "high"); the agent's
+            # provider sets "low" in Hermes, which keeps each tool round quick.
+            for k in STRATA_ONLY_FIELDS + ("seed", "top_k", "reasoning_effort"):
                 body.pop(k, None)
             # The agent thinks with whatever holds the PC's GPU; asleep, with its own default.
             body.pop("provider", None)
@@ -1216,17 +1387,25 @@ class Handler(BaseHTTPRequestHandler):
             if s.get("online") and e.get("active") == "strata" and e.get("state") != "loading":
                 body.update(provider=AGENT_PROVIDER_STRATA, model="strata")
             elif s.get("online") and e.get("active") == "ollama":
-                body.update(provider=AGENT_PROVIDER_OLLAMA, model=ollama_model(s))
+                body.update(provider=AGENT_PROVIDER_OLLAMA, model=selected)
             return self._proxy(AGENT_URL + "/v1/chat/completions", "POST", json.dumps(body).encode(),
-                               AGENT_KEY, stream, timeout=900)
+                               AGENT_KEY, stream, timeout=900, hermes=True)
         if not s.get("online"):
             return self._err(503, "%s is asleep — wake it under Manage." % PC_NAME)
         if strata_up(s):
+            body["model"] = e.get("model") or body.get("model") or "strata"
+            if isinstance(body.get("messages"), list):
+                # With web tools the model kept reading shop pages that answer 403 until it hit
+                # mcp.max_rounds, and Strata ends an answer there without any text. The research
+                # part keeps it to a few reads and makes it always finish with an answer.
+                with_system(body, system_note(STRATA_LABEL, True, bool(body.get("strata_mcp"))))
             return self._proxy(STRATA_URL + "/v1/chat/completions", "POST", json.dumps(body).encode(),
                                STRATA_KEY, stream, timeout=900)
         if e.get("active") == "strata":
             return self._err(503, "Strata is still loading — about 80 s after the switch.")
-        body["model"] = ollama_model(s)
+        body["model"] = selected or ollama_model(s)
+        if isinstance(body.get("messages"), list):
+            with_system(body, system_note(body["model"] + " (served by Ollama)", False, False))
         return self._proxy(OLLAMA + "/v1/chat/completions", "POST", json.dumps(body).encode(), "", stream, timeout=900)
 
     def _strata_path(self, method, path, query, raw):
@@ -1243,7 +1422,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "mcp":           # no MCP servers while Strata is off: an empty list, not an error
             return self._send(200, {"servers": [], "tools": 0})
         if path == "models":
-            return self._send(200, {"object": "list", "data": [{"id": synth_health(s)["model"], "object": "model"}]})
+            try:
+                return self._send(200, dict(installed_models(s), object="list"))
+            except Exception:
+                return self._err(503, "Could not read installed models. Check the engine under Manage.")
         # config / settings / mcp / load / unload are Strata's own: absent while it is off,
         # which the page already handles (it hides those cards).
         return self._err(404, "only while Strata runs")
@@ -1254,7 +1436,24 @@ class Handler(BaseHTTPRequestHandler):
         if path == "api/stats":
             with _lock:
                 return self._send(200, json.dumps(_snapshot).encode())
+        if path == "api/models":
+            try:
+                return self._send(200, installed_models(_snap()))
+            except ValueError as e:
+                return self._err(503, str(e))
+            except Exception:
+                return self._err(503, "Could not read installed models. Check the engine under Manage.")
         if path in ("", "index.html"):
+            # a tailnet device on plain http gets the https address (only there may the page use the microphone);
+            # only the page redirects, API calls stay as they are. LAN devices without Tailscale stay on http.
+            ip = self.client_address[0]
+            if HTTPS_URL and ip not in ("127.0.0.1", "::1") and _tailnet(ip):
+                self.send_response(302)
+                self.send_header("Location", HTTPS_URL + "/" + (("?" + u.query) if u.query else ""))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             f = ui_file("index.html")
             return self._send(200, f[0], f[1]) if f else self._err(500, "ui/index.html missing")
         if path == "favicon.ico":
@@ -1266,6 +1465,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, f[0], f[1]) if f else self._err(404, "not found")
         if path.startswith(CONTROL_PATHS) and not _tailnet(self.client_address[0]):
             return self._err(403, "Only from a Tailscale device.")
+        if path == "api/voice":            # strata-voice (talk to the model); empty url = no voice button
+            return self._send(200, json.dumps({"url": VOICE_URL}).encode())
+        if path.startswith("api/builder/"):
+            return self._builder("GET", path, u.query, None)
         if path == "api/chats":
             return self._send(200, chats_list())
         if path.startswith("api/chats/"):
@@ -1312,6 +1515,8 @@ class Handler(BaseHTTPRequestHandler):
                                   "the agent behind them can run commands on the Mac.")
         if path == "v1/chat/completions":
             return self._chat(raw)
+        if path.startswith("api/builder/"):
+            return self._builder("POST", path, u.query, raw)
         if path in STRATA_PATHS or path.startswith("v1/"):
             return self._strata_path("POST", path, u.query, raw)
         if path == "api/power":
@@ -1323,7 +1528,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "api/rgb":
             ok, msg = rgb_action(self._json_field(raw, "color"))
         elif path == "api/engine":
-            ok, msg = engine_action(self._json_field(raw, "engine"))
+            ok, msg = engine_action(self._json_field(raw, "engine"), self._json_field(raw, "model"))
         elif path == "api/wake":
             # direct=1 comes from another dashboard relaying to us: broadcast
             # locally only, never relay onward, so the two can't ping-pong.

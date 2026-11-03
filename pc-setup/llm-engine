@@ -6,8 +6,9 @@
 #
 # Lives on the PC, like rgb-apply, so the dashboard composes no service names
 # or addresses itself. Strata's address is read from its own config file.
-set -u
-STRATA_CFG=${STRATA_CFG:-/home/user/Strata/strata-coder-iq1_m.json}
+set -eu
+STRATA_DIR=${STRATA_DIR:-/home/user/Strata}
+STRATA_CFG=${STRATA_CFG:-$STRATA_DIR/strata-active.json}
 USER_NAME=user   # the account that owns Ollama's user unit
 UID_NUM=1000
 
@@ -24,31 +25,65 @@ strata_cfg() {
 import json, sys
 c = json.load(open(sys.argv[1]))
 print({"url": "http://%s:%s" % (c.get("host") or "127.0.0.1", c.get("port") or 8080),
-       "key": c.get("api_key") or ""}[sys.argv[2]])
+       "key": c.get("api_key") or "",
+       "model": c.get("model_name") or "strata"}[sys.argv[2]])
 EOF
 }
 
 case "${1:-}" in
     strata)
+        # Serialize switches from multiple dashboards; accept only known variants.
+        exec 9>/run/llm-engine.lock
+        flock -w 90 9
+        variant=${2:-}
+        if [ -n "$variant" ]; then
+            case "$variant" in q2_0|coder-iq1_m) ;; *) echo "unknown Strata model" >&2; exit 2 ;; esac
+            cfg="$STRATA_DIR/strata-$variant.json"
+            [ -f "$cfg" ] || { echo "Strata model config is missing" >&2; exit 1; }
+            python3 - "$cfg" <<'EOF'
+import json, sys
+from pathlib import Path
+c = json.load(open(sys.argv[1]))
+a = c["args"]
+for flag in ("--native", "--ple-gguf"):
+    if not Path(a[a.index(flag) + 1]).is_file():
+        raise SystemExit("Strata model download is incomplete")
+if not Path(a[a.index("--pack") + 1], "index.txt").is_file():
+    raise SystemExit("Strata model preparation is incomplete")
+EOF
+            if [ "$(readlink -f "$STRATA_CFG" 2>/dev/null)" != "$cfg" ]; then
+                systemctl stop strata.service
+                ln -sfn "$cfg" "$STRATA_CFG.next"
+                mv -Tf "$STRATA_CFG.next" "$STRATA_CFG"
+            fi
+        fi
         ollama_ctl stop ollama.service
         systemctl start strata.service && echo ok
         ;;
     ollama)
+        exec 9>/run/llm-engine.lock
+        flock -w 90 9
         systemctl stop strata.service
         ollama_ctl start ollama.service && echo ok
         ;;
     probe)
         echo "engine_avail=1"
-        s=$(systemctl is-active strata.service 2>/dev/null)
-        o=$(ollama_ctl is-active ollama.service 2>/dev/null)
+        s=$(systemctl is-active strata.service 2>/dev/null || true)
+        o=$(ollama_ctl is-active ollama.service 2>/dev/null || true)
         echo "engine_strata=$s"
         echo "engine_ollama=$o"
+        echo "strata_model=$(strata_cfg model)"
+        for variant in q2_0 coder-iq1_m; do
+            if [ -f "$STRATA_DIR/strata-$variant.json" ] && [ -f "${STRATA_DIR}-data/packs/$variant/index.txt" ]; then
+                echo "strata_installed_${variant//-/_}=1"
+            fi
+        done
         if [ "$s" = active ]; then
             # With an api_key in the config every endpoint wants it, /status
             # included. While the model is still loading (~80 s) the server does
             # not answer yet: report that as "loading".
             st=$(curl -s --max-time 2 -H "Authorization: Bearer $(strata_cfg key)" \
-                 "$(strata_cfg url)/status" 2>/dev/null)
+                 "$(strata_cfg url)/status" 2>/dev/null || true)
             if [ -n "$st" ]; then
                 # /status: "busy", plus tokens_per_s once the first token is out
                 # (before that it is still reading the prompt).
@@ -69,7 +104,7 @@ else:
         fi
         ;;
     *)
-        echo "usage: llm-engine ollama|strata|probe" >&2
+        echo "usage: llm-engine ollama|strata [q2_0|coder-iq1_m]|probe" >&2
         exit 2
         ;;
 esac

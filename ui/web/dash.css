@@ -3,6 +3,12 @@
 
 /* body is 100% high in app.css; on phones 100dvh follows the browser bars and the on-screen keyboard */
 html, body { height: 100dvh; }
+html { overflow: hidden; }
+html[data-mobile-viewport] body { position: fixed; top: var(--dash-viewport-top, 0px); left: 0; right: 0;
+                                height: var(--dash-viewport-height, 100dvh); }
+.chat-scroll { overscroll-behavior: contain; overflow-anchor: none; }
+.st-composer__bar { min-width: 0; }
+.st-composer__bar > .st-btn { flex-shrink: 0; }
 /* iOS: no double-tap zoom on buttons (a quick second tap on Send zoomed the page) */
 html { touch-action: manipulation; -webkit-text-size-adjust: 100%; }
 /* iOS zooms into any field under 16 px when it gets focus: every field is 16 px on touch screens */
@@ -68,9 +74,51 @@ body { padding-left: env(safe-area-inset-left); padding-right: env(safe-area-ins
   .st-composer__bar { gap: 2px; flex-wrap: nowrap; }
   .st-composer__bar .st-btn--icon { width: 34px; height: 34px; }
   #export-btn, #composer-hint { display: none; }
-  .chat-target button { padding: 0 8px; height: 30px; }
   .st-msg { max-width: 100%; }
   .st-toasts { left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); }
   .st-toast { max-width: none; }
   .manage { padding: var(--st-s-3) !important; }
 }
+
+/* The views are flex items: without min-width 0 a long tool preview or thinking line made the chat column
+   as wide as its content (860 px on a 390 px phone) and the answer was cut off at the right edge. */
+.view, .chat-scroll { min-width: 0; }
+
+/* ---------- voice mode (voice.js): takes the composer's place while a call runs */
+.voice-bar { display: flex; align-items: center; gap: var(--st-s-4); padding: var(--st-s-3) var(--st-s-4);
+  background: var(--st-surface); border: 1px solid var(--st-line); border-radius: var(--st-r-xl);
+  box-shadow: var(--st-sh-bar); min-height: 76px; }
+.voice-bar[hidden] { display: none; }
+.voice-orb { position: relative; flex: 0 0 auto; width: 52px; height: 52px; border: 0; padding: 0; cursor: pointer;
+  border-radius: 50%; background: none; display: grid; place-items: center; }
+.voice-orb::before { content: ""; position: absolute; inset: 0; border-radius: 50%; background: var(--st-accent);
+  opacity: .18; transform: scale(var(--lvl, 1)); transition: transform 70ms linear; }
+.voice-orb span { width: 34px; height: 34px; border-radius: 50%; background: var(--st-accent);
+  transition: background var(--st-dur) var(--st-ease); }
+.voice-bar[data-state="user"] .voice-orb span, .voice-bar[data-state="user"] .voice-orb::before { background: var(--st-info); }
+.voice-bar[data-state="thinking"] .voice-orb span { animation: voice-think 1.1s ease-in-out infinite; }
+@keyframes voice-think { 50% { transform: scale(.82); opacity: .7; } }
+.voice-text { flex: 1; min-width: 0; }
+.voice-label { font-weight: var(--st-fw-medium); font-size: var(--st-fs-md); }
+.voice-hint { color: var(--st-ink-muted); font-size: var(--st-fs-sm); white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; }
+#voice-mute.on { background: var(--st-warn); color: #fff; border-color: var(--st-warn); }
+.voice-bar .st-btn.voice-end, .voice-bar .st-btn.voice-end:hover { background: var(--st-danger); border-color: var(--st-danger); color: #fff; }
+@media (max-width: 520px) {
+  .voice-bar { gap: var(--st-s-3); padding: var(--st-s-3); }
+  .voice-hint { display: none; }
+}
+.voice-bar { position: relative; }
+.voice-pop { position: absolute; right: 0; bottom: calc(100% + 8px); width: min(320px, calc(100vw - 32px));
+  background: var(--st-surface); border: 1px solid var(--st-line); border-radius: var(--st-r-lg);
+  box-shadow: var(--st-sh-pop); padding: var(--st-s-4); z-index: 20; }
+.voice-pop[hidden] { display: none; }
+.voice-pop label { display: block; margin-bottom: var(--st-s-4); font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.voice-pop select, .voice-pop input[type=range] { display: block; width: 100%; margin-top: var(--st-s-2); }
+.voice-pop select { font: inherit; font-size: 16px; color: var(--st-ink); background: var(--st-bg);
+  border: 1px solid var(--st-line); border-radius: var(--st-r-md); padding: 8px; }
+.voice-pop input[type=range] { accent-color: var(--st-accent); }
+.voice-pop p { margin: 0; font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.voice-bar[data-state="searching"] .voice-orb span { animation: voice-think 1.1s ease-in-out infinite; }
+.voice-pop label.voice-check { display: flex; align-items: center; gap: var(--st-s-2); color: var(--st-ink); }
+.voice-pop label.voice-check input { margin: 0; accent-color: var(--st-accent); }

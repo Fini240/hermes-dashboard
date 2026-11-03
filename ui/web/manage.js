@@ -17,11 +17,21 @@
   // Who answers the chat: the model on the PC (Strata or Ollama, whichever holds the GPU) or the Hermes agent
   // (tools, memory, terminal on the Mac). The dashboard server routes on this header; app.js never knows.
   let target = store.get("dash.chat-target", "model");
+  let preferredModel = store.get("dash.chat-model", ""), selectedModel = "", modelEngine = "";
+  let modelList = [], strataModels = [], modelsLoading = false, modelsError = "", modelRefreshAt = 0;
+  let engineLoading = false, engineSwitching = false;
   const realFetch = window.fetch.bind(window);
   window.fetch = (url, opts) => {
     if (typeof url === "string" && url.replace(/^\//, "").startsWith("v1/chat/completions")) {
       opts = Object.assign({}, opts);
       opts.headers = Object.assign({}, opts.headers, {"X-Chat-Target": target});
+      if (selectedModel && modelEngine && !modelsError) {
+        opts.headers["X-Chat-Model"] = selectedModel;
+        opts.headers["X-Chat-Engine"] = modelEngine;
+        const body = JSON.parse(opts.body);
+        body.model = selectedModel;
+        opts.body = JSON.stringify(body);
+      }
     }
     return realFetch(url, opts);
   };
@@ -54,6 +64,27 @@
 .chat-target{display:inline-flex;gap:2px;padding:3px;background:var(--st-surface-2);border:1px solid var(--st-line);border-radius:10px}
 .chat-target button{height:30px;padding:0 10px;border:0;border-radius:8px;background:transparent;color:var(--st-ink-muted);font:500 var(--st-fs-sm)/1 var(--st-font);cursor:pointer;white-space:nowrap}
 .chat-target button[aria-pressed="true"]{background:var(--st-surface);color:var(--st-ink);font-weight:700;box-shadow:var(--st-sh-card)}
+.chat-model-trigger{display:inline-flex;align-items:center;gap:5px;min-width:0;max-width:210px;height:32px;padding:0 9px;border:0;border-radius:8px;background:var(--st-surface-2);color:var(--st-ink);font:500 var(--st-fs-sm)/1 var(--st-font);cursor:pointer;flex-shrink:1}
+.chat-model-trigger span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.chat-model-trigger .st-icon{width:14px;height:14px;flex:none}
+.chat-model-trigger[aria-expanded="true"] .st-icon{transform:rotate(180deg)}
+.chat-model-trigger:hover,.chat-model-trigger[aria-expanded="true"]{background:var(--st-line-soft)}
+.chat-model-trigger:focus-visible,.chat-model-menu button:focus-visible{outline:2px solid var(--st-accent);outline-offset:1px}
+.chat-model-trigger:disabled{opacity:.65;cursor:default}
+.chat-model-menu{position:fixed;z-index:20;display:flex;flex-direction:column;gap:5px;padding:8px;border:1px solid var(--st-line);border-radius:14px;background:var(--st-surface);color:var(--st-ink);box-shadow:var(--st-sh-pop);overflow:hidden}
+.chat-model-menu__head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding-left:8px;font-size:var(--st-fs-xs);color:var(--st-ink-muted);flex:none}
+.chat-model-menu__head .st-btn--icon{width:30px;height:30px}
+.chat-model-list{overflow-y:auto;overscroll-behavior:contain;min-height:0;scroll-padding:4px}
+.chat-model-option{display:flex;align-items:center;gap:12px;width:100%;padding:9px 10px;border:0;border-radius:8px;background:transparent;color:var(--st-ink);text-align:left;font:500 var(--st-fs-md)/1.3 var(--st-font);cursor:pointer}
+.chat-model-option:hover,.chat-model-option:focus-visible{background:var(--st-surface-2)}
+.chat-model-option__label{flex:1;min-width:0}
+.chat-model-option small{display:block;margin-top:3px;color:var(--st-ink-muted);font-size:var(--st-fs-xs);font-weight:400;overflow-wrap:anywhere}
+.chat-model-check{width:16px;flex:none;color:var(--st-accent);visibility:hidden}
+.chat-model-option[aria-checked="true"] .chat-model-check{visibility:visible}
+.chat-model-menu__foot{border-top:1px solid var(--st-line);padding-top:5px;flex:none}
+.chat-model-status{font-size:var(--st-fs-xs);color:var(--st-ink-muted);overflow-wrap:anywhere;padding:4px 8px}
+.chat-model-status:empty{display:none}
+@media(max-width:640px){.chat-model-trigger{flex:1;max-width:190px;height:34px;padding:0 8px}.st-composer__bar .spacer{display:none}}
 @media(max-width:860px){.manage{grid-template-columns:1fr;padding:var(--st-s-4)}}`;
   document.head.insertAdjacentHTML("beforeend", `<style>${css}</style>`);
 
@@ -71,17 +102,19 @@
         <span class="card-title">Model engine</span>
         <div class="mg-row"><div class="mg-seg" id="mg-eng">
           <button data-eng="ollama"><span class="mg-dot"></span><span>Ollama</span></button>
-          <button data-eng="strata"><span class="mg-dot"></span><span>Strata 125B</span></button></div></div>
+          <button data-eng="strata" data-model="qwen3.8-flash-next-q2_0"><span class="mg-dot"></span><span>Strata Q2_0</span></button>
+          <button data-eng="strata" data-model="qwen3.8-flash-next-coder-iq1_m"><span class="mg-dot"></span><span>Strata Coder</span></button></div></div>
         <p class="muted small">Only one runs at a time — both need the whole GPU. Ollama: the everyday models, fastest
-          overall. Strata: the 125B coder, strongest at code (~33 tok/s, about 80 s to load). The PC stops Strata before it
-          suspends and comes back with Ollama.</p>
+          overall. Strata Q2_0: the full 125B model. Strata Coder: the smaller coding variant. Loading can take
+          1–3 minutes. Strata keeps the PC awake; switch to Ollama to allow idle sleep.</p>
         <div class="mg-msg" id="mg-eng-msg"></div>
       </div>
       <div class="st-card">
         <span class="card-title">Chat goes to</span>
         <div class="mg-row"><div class="mg-seg" id="mg-target">
           <button data-t="model"><span class="mg-dot on"></span><span>Model on the PC</span></button>
-          <button data-t="agent"><span class="mg-dot" id="mg-agent-dot"></span><span>Hermes agent</span></button></div></div>
+          <button data-t="agent"><span class="mg-dot" id="mg-agent-dot"></span><span>Hermes agent</span></button>
+          <button data-t="builder"><span class="mg-dot" id="mg-builder-dot"></span><span>Builder</span></button></div></div>
         <p class="muted small" id="mg-target-note"></p>
       </div>
       <div class="st-card">
@@ -114,7 +147,7 @@
       </div>`;
 
     for (const b of $("mg-eng").querySelectorAll("button")) b.onclick = () => doEngine(b);
-    for (const b of $("mg-target").querySelectorAll("button")) b.onclick = () => setTarget(b.dataset.t);
+    for (const b of $("mg-target").querySelectorAll("button")) b.onclick = () => chooseTarget(b.dataset.t);
     for (const b of document.querySelectorAll(".mg-btn")) b.onclick = () => doPower(b);
     $("mg-mon").onclick = doMonitors;
     for (const b of $("mg-rgb").querySelectorAll("button")) b.onclick = () => post("/api/rgb", {color: b.dataset.c}, "mg-rgb-msg");
@@ -126,22 +159,168 @@
   // the composer's own switch, so the target is visible where you type
   function buildComposerSwitch() {
     const bar = document.querySelector(".st-composer__bar .spacer");
-    if (!bar || $("chat-target")) return;
-    bar.insertAdjacentHTML("beforebegin", `<span class="chat-target" id="chat-target" title="Who answers">
-      <button type="button" data-t="model">Model</button><button type="button" data-t="agent">Hermes agent</button></span>`);
-    for (const b of $("chat-target").querySelectorAll("button")) b.onclick = () => setTarget(b.dataset.t);
+    if (!bar || $("chat-model")) return;
+    bar.insertAdjacentHTML("afterend", `<button type="button" class="chat-model-trigger" id="chat-model" aria-label="Choose model" aria-haspopup="menu" aria-expanded="false" aria-controls="chat-model-menu"><span>Loading models…</span>${icon("chevron")}</button>`);
+    document.body.insertAdjacentHTML("beforeend", `<div class="chat-model-menu" id="chat-model-menu" role="menu" aria-label="Models and chat mode" hidden>
+      <div class="chat-model-menu__head"><span id="chat-model-label">Installed models</span>
+        <button type="button" class="st-btn st-btn--icon" id="chat-model-refresh" role="menuitem" aria-label="Refresh installed models" title="Refresh installed models">${icon("refresh")}</button></div>
+      <div class="chat-model-list" id="chat-model-list" role="group" aria-label="Installed models"></div>
+      <div class="chat-model-menu__foot" id="chat-target"><button type="button" class="chat-model-option" data-t="builder" role="menuitemcheckbox" aria-checked="false">
+        <span class="chat-model-option__label">Builder<small>Builds apps in a project folder on the PC</small></span><span class="chat-model-check" aria-hidden="true">✓</span></button>
+        <button type="button" class="chat-model-option" data-t="agent" role="menuitemcheckbox" aria-checked="false">
+        <span class="chat-model-option__label">Hermes agent<small>Answer with tools and memory</small></span><span class="chat-model-check" aria-hidden="true">✓</span></button></div>
+      <div class="chat-model-status" id="chat-model-status" role="status"></div></div>`);
+    $("chat-model").onclick = () => toggleModels($("chat-model-menu").hidden);
+    $("chat-model").onkeydown = (e) => {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); toggleModels(true); }
+    };
+    $("chat-model-list").onclick = (e) => {
+      const option = e.target.closest("[data-model]"); if (!option) return;
+      if (option.disabled || (typeof busy !== "undefined" && busy)) return;
+      if (option.dataset.engine === "strata" && (modelEngine !== "strata" || selectedModel !== option.dataset.model)) {
+        toggleModels(false, true); switchEngine("strata", option.dataset.model); return;
+      }
+      selectedModel = option.dataset.model;
+      if (modelEngine === "ollama") { preferredModel = selectedModel; store.set("dash.chat-model", selectedModel); }
+      toggleModels(false, true); paintModels(); paintTarget();
+      if (typeof saveChat === "function") saveChat();
+    };
+    for (const b of $("chat-target").querySelectorAll("button")) b.onclick = () => {
+      chooseTarget(target === b.dataset.t ? "model" : b.dataset.t); toggleModels(false, true);
+    };
+    $("chat-model-refresh").onclick = () => loadModels();
+    $("chat-model-menu").onkeydown = (e) => {
+      const buttons = [...$("chat-model-menu").querySelectorAll("button:not(:disabled)")];
+      const at = buttons.indexOf(document.activeElement);
+      if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
+        e.preventDefault();
+        const next = e.key === "Home" ? 0 : e.key === "End" ? buttons.length - 1
+          : (at + (e.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length;
+        buttons[next]?.focus({preventScroll: true});
+        buttons[next]?.scrollIntoView({block: "nearest"});
+      }
+      if (e.key === "Escape") { e.preventDefault(); toggleModels(false, true); }
+      if (e.key === "Tab") toggleModels(false, true);
+    };
+    document.addEventListener("pointerdown", (e) => {
+      if (!$("chat-model-menu").contains(e.target) && !$("chat-model").contains(e.target)) toggleModels(false);
+    });
+    window.addEventListener("resize", positionModels);
+    window.visualViewport?.addEventListener("resize", positionModels);
+    window.visualViewport?.addEventListener("scroll", positionModels);
   }
+  function modelName(model) {
+    if (!model) return "Choose model";
+    if (model.label) return model.label;
+    const id = model.id.toLowerCase(), params = id.match(/(?:[-:])(\d+(?:\.\d+)?)b/)?.[1];
+    let name = id.includes("ministral-3") ? `Ministral 3 ${params || ""}B`
+      : id.includes("qwen3.5") ? `Qwen 3.5 ${params || "9"}B`
+      : id.includes("gemma4") || id.includes("gemma-4") ? `Gemma 4 ${params || "12"}B`
+      : model.id.split("/").pop().replace(/:latest$/, "");
+    if (id.includes("abl")) name += " Abl";
+    const context = id.match(/-(\d+)k/)?.[1];
+    return name + (context ? ` · ${context}K` : "");
+  }
+  function toggleModels(open, restoreFocus = false) {
+    const menu = $("chat-model-menu"), trigger = $("chat-model"); if (!menu) return;
+    menu.hidden = !open; trigger.setAttribute("aria-expanded", String(open));
+    if (open) {
+      positionModels();
+      const option = menu.querySelector('.chat-model-list [aria-checked="true"]') || menu.querySelector("button:not(:disabled)");
+      option?.focus({preventScroll: true}); option?.scrollIntoView({block: "nearest"});
+    } else if (restoreFocus) trigger.focus({preventScroll: true});
+  }
+  function positionModels() {
+    const menu = $("chat-model-menu"); if (!menu || menu.hidden) return;
+    const rect = $("chat-model").getBoundingClientRect(), v = window.visualViewport;
+    const x = v?.offsetLeft || 0, y = v?.offsetTop || 0, w = v?.width || innerWidth, h = v?.height || innerHeight;
+    const width = Math.min(360, w - 24), above = rect.top - y > 180;
+    const available = above ? rect.top - y - 20 : y + h - rect.bottom - 20;
+    menu.style.width = `${width}px`; menu.style.maxHeight = `${Math.max(80, Math.min(w <= 640 ? 360 : 420, available))}px`;
+    menu.style.left = `${Math.max(x + 12, Math.min(rect.right - width, x + w - width - 12))}px`;
+    menu.style.top = `${Math.max(y + 8, above ? rect.top - menu.offsetHeight - 8 : rect.bottom + 8)}px`;
+  }
+  async function loadModels() {
+    if (modelsLoading) return;
+    modelsLoading = true; modelRefreshAt = Date.now(); paintModels();
+    try {
+      const r = await realFetch("/api/models", {cache: "no-store"});
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error?.message || "Could not read installed models.");
+      modelEngine = data.engine; modelList = data.data || []; modelsError = "";
+      strataModels = data.strata_models || []; engineLoading = data.state === "loading" || data.state === "error";
+      const wanted = modelEngine === "ollama" ? preferredModel : selectedModel;
+      selectedModel = modelEngine === "strata" ? data.default : modelList.some((m) => m.id === wanted) ? wanted
+        : modelList.some((m) => m.id === data.default) ? data.default : modelList[0]?.id || "";
+      if (modelEngine === "ollama" && selectedModel) {
+        preferredModel = selectedModel; store.set("dash.chat-model", selectedModel);
+      }
+    } catch (e) { modelsError = e.message; selectedModel = ""; modelList = []; }
+    modelsLoading = false; paintModels(); paintTarget();
+  }
+  function paintModels() {
+    const trigger = $("chat-model"); if (!trigger) return;
+    const working = (typeof busy !== "undefined" && !!busy) || engineSwitching;
+    const option = (m, engine) => `<button type="button" class="chat-model-option" role="menuitemradio" aria-checked="${engine === modelEngine && m.id === selectedModel}" data-model="${esc(m.id)}" data-engine="${engine}" ${working ? "disabled" : ""}>
+      <span class="chat-model-option__label">${esc(modelName(m))}<small>${esc(m.id)}</small></span><span class="chat-model-check" aria-hidden="true">✓</span></button>`;
+    const options = modelList.map((m) => option(m, modelEngine)).join("") + (modelEngine !== "strata" && strataModels.length
+      ? `<div class="chat-model-menu__head">Strata · switches the GPU</div>` + strataModels.map((m) => option(m, "strata")).join("") : "");
+    if ($("chat-model-list").innerHTML !== options) $("chat-model-list").innerHTML = options;
+    const name = selectedModel ? modelName(modelList.find((m) => m.id === selectedModel))
+      : modelsLoading ? "Loading models…" : modelsError ? "Models unavailable" : "Choose model";
+    trigger.querySelector("span").textContent = (target === "agent" ? "Hermes · " : target === "builder" ? "Builder · " : "") + (engineSwitching ? "Switching…" : name + (engineLoading ? " · loading…" : ""));
+    trigger.disabled = working;
+    trigger.title = `${modelEngine === "strata" ? "Strata" : "Ollama"} · ${selectedModel || modelsError || "Choose model"}`;
+    trigger.setAttribute("aria-label", `Choose model: ${target === "agent" ? "Hermes agent, " : ""}${selectedModel || name}`);
+    if (trigger.disabled) toggleModels(false);
+    $("chat-model-refresh").disabled = modelsLoading || working;
+    $("chat-model-label").textContent = modelEngine === "strata" ? "Strata" : "Installed Ollama models";
+    $("chat-model-status").textContent = modelsError || (engineLoading ? "Loading the model — Send becomes available when it is ready." : modelEngine === "strata" ? "Switch to Ollama under Manage" : "");
+    const send = $("send-btn");
+    if (send) send.disabled = working || engineLoading || (target === "builder" ? modelEngine !== "strata"
+      : target !== "agent" && (modelsLoading || !!modelsError || !selectedModel));
+    if (target === "builder" && modelEngine && modelEngine !== "strata" && !modelsLoading)
+      $("chat-model-status").textContent = "Builder thinks with Strata — switch the engine to Strata under Manage.";
+    positionModels();
+  }
+  window.dashModelBusy = paintModels;
+  window.dashGetModel = () => selectedModel || preferredModel;
+  window.dashSetModel = (model) => {
+    if (strataModels.some((m) => m.id === model)) return;
+    preferredModel = typeof model === "string" ? model : "";
+    store.set("dash.chat-model", preferredModel);
+    if (modelEngine === "ollama") {
+      if (modelList.some((m) => m.id === preferredModel)) { selectedModel = preferredModel; paintModels(); paintTarget(); }
+      else loadModels();
+    }
+  };
   function setTarget(t) { target = t; store.set("dash.chat-target", t); paintTarget(); }
+  // The user picks a target. A Builder chat is tied to its agent session, so switching into or out of
+  // Builder with messages on screen starts a new chat instead of mixing the two.
+  function chooseTarget(t) {
+    if (t === target || (typeof busy !== "undefined" && busy && !busy.builder)) return;
+    const crossing = (t === "builder") !== (target === "builder");
+    if (crossing && typeof messages !== "undefined" && messages.length && window.dashNewChat) window.dashNewChat();
+    setTarget(t);
+    if (!crossing && typeof saveChat === "function") saveChat();
+  }
   window.dashSetTarget = setTarget;   // chats.js: an opened chat brings back who it talked to
+  window.dashGetTarget = () => target;
   function paintTarget() {
     for (const b of document.querySelectorAll("#mg-target button, #chat-target button"))
       b.setAttribute("aria-pressed", String(b.dataset.t === target));
+    for (const b of document.querySelectorAll("#chat-target button")) b.setAttribute("aria-checked", String(target === b.dataset.t));
+    paintModels();
     const sub = $("chat-empty-sub");
-    if (sub && target === "agent") sub.textContent = "Hermes answers with its tools and memory — it can run commands on the Mac.";
+    if (sub && target === "agent") sub.textContent = "Hermes answers with its tools and memory — it can run commands on the PC.";
+    else if (sub && selectedModel) sub.textContent = `${selectedModel} runs on this PC. Nothing leaves it.`;
     const n = $("mg-target-note");
     if (n) n.textContent = target === "agent"
-      ? "The Hermes agent on the Mac answers, with its tools, memory and terminal. It thinks with the model on the PC (Strata or Ollama), or with the Mac's own 4B when the PC is asleep."
+      ? "The Hermes agent on the PC answers, with its tools, memory and terminal. It thinks with the model on the PC (Strata or Ollama)."
+      : target === "builder"
+      ? "Builder — your own coding agent on the PC — works in a project folder (~/Projects): it writes files, runs commands and serves apps. It needs Strata as the engine. A run keeps going when you close the page."
       : "The model on the PC answers directly — fast, no tools. Strata or Ollama, whichever holds the GPU.";
+    if (window.dashBuilder) window.dashBuilder.targetChanged();
   }
 
   // ---------------------------------------------------------------- actions
@@ -156,11 +335,25 @@
   let engBusy = 0;
   async function doEngine(b) {
     if (b.disabled || b.getAttribute("aria-pressed") === "true") return;
-    engBusy = Date.now();
-    b.querySelector("span:last-child").textContent = "Switching…";
-    for (const o of $("mg-eng").querySelectorAll("button")) o.disabled = true;
-    await post("/api/engine", {engine: b.dataset.eng}, "mg-eng-msg");
-    setTimeout(() => { engBusy = 0; }, 3000);
+    await switchEngine(b.dataset.eng, b.dataset.model || "");
+  }
+  async function switchEngine(engine, model) {
+    if (engineSwitching || (typeof busy !== "undefined" && busy)) return;
+    engineSwitching = true; engBusy = Date.now(); paintModels();
+    for (const b of $("mg-eng").querySelectorAll("button")) b.disabled = true;
+    const result = await post("/api/engine", {engine, model}, "mg-eng-msg");
+    try {
+      if (!result.ok) throw new Error(result.message || "Could not switch the model.");
+      for (let n = 0; n < 15; n++) {
+        const s = await (await realFetch("/api/stats", {cache: "no-store"})).json();
+        if (s.engine?.active === engine && (!model || s.engine.model === model)) {
+          paint(s); await loadModels(); return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+      throw new Error("The switch is still pending. Refresh the models in a moment.");
+    } catch (e) { if (typeof toast === "function") toast("error", "Model switch", e.message); }
+    finally { engineSwitching = false; engBusy = 0; paintModels(); }
   }
   async function doPower(b) {
     const msg = $("mg-pw-msg"), act = b.dataset.act, label = act === "suspend" ? "Suspend" : "Shut down";
@@ -208,12 +401,18 @@
 
     // engine
     const e = s.engine;
+    engineLoading = e?.active === "strata" && (e.state === "loading" || e.state === "error");
+    strataModels = s.strata_models || strataModels;
     if (!engBusy) for (const b of $("mg-eng").querySelectorAll("button")) {
-      const name = b.dataset.eng === "strata" ? "Strata 125B" : "Ollama", on = !!e && e.active === b.dataset.eng;
-      b.disabled = !e; b.setAttribute("aria-pressed", String(on));
+      const name = b.dataset.eng === "strata" ? (b.dataset.model.endsWith("q2_0") ? "Strata Q2_0" : "Strata Coder") : "Ollama";
+      const on = !!e && e.active === b.dataset.eng && (!b.dataset.model || e.model === b.dataset.model);
+      b.disabled = !e || engineSwitching || (typeof busy !== "undefined" && !!busy)
+        || (b.dataset.eng === "strata" && !strataModels.some((m) => m.id === b.dataset.model));
+      b.setAttribute("aria-pressed", String(on));
       b.querySelector(".mg-dot").className = "mg-dot" + (on ? (e.state === "loading" || e.state === "error" ? " warn" : " on") : "");
       b.querySelector("span:last-child").textContent = on ? `${name} · ${ENG[e.state] || e.state}` : name;
     }
+    paintModels();
 
     // chat target: is the agent reachable?
     $("mg-agent-dot").className = "mg-dot" + (s.agent == null ? "" : s.agent ? " on" : " off");
@@ -422,6 +621,7 @@ body.dash-drag-active,body.dash-drag-active *{cursor:grabbing!important}
       const s = await (await realFetch("/api/stats", {cache: "no-store"})).json();
       paint(s);
       paintExtra(s);
+      if ((s.engine && (s.engine.active !== modelEngine || (s.engine.active === "strata" && s.engine.model !== selectedModel))) || Date.now() - modelRefreshAt > 30000) loadModels();
     } catch (e) { /* dashboard server restarting */ }
     setTimeout(poll, tabNow === "manage" || tabNow === "monitor" ? 2000 : 5000);
   }
@@ -429,6 +629,6 @@ body.dash-drag-active,body.dash-drag-active *{cursor:grabbing!important}
     build(); buildLayoutCard(); buildExtraCards(); applyLayout();
     sortable($("metrics"), ".metric-card", (it) => it.querySelector(".st-metric__value").id.slice(3), () => paintLayoutCard());
     sortable($("mg-cards"), ".mg-item", (it) => it.querySelector("input").dataset.k, () => {});
-    buildComposerSwitch(); paintTarget(); poll();
+    buildComposerSwitch(); paintTarget(); loadModels(); poll();
   });
 })();
