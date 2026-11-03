@@ -89,6 +89,20 @@ instead of drifting across forked copies. See `.env.example` for the annotated l
 | `HERMES_SSH_KEY` / `HERMES_KNOWN_HOSTS` | Key paths (no ssh-agent in a container) |
 | `HERMES_STATE_SYNC` | `user@host:/path/to/state.db`; blank disables token panels |
 | `HERMES_STATE_SYNC_SECONDS` | Token sync interval (default 15) |
+| `HERMES_H3_URL` / `HERMES_H3_KEY` | h3-engine on the PC for the Video tab; blank = the tab says it is not configured |
+
+## Video (MiniMax H3)
+
+The Video tab makes short clips **with sound** on the PC: text, a start picture, or a reference
+picture. The work happens in **h3-engine**, a small job server on the PC (stable-diffusion.cpp's
+`sd-cli` + ffmpeg). This dashboard only proxies `/api/video/*` and adds the key; clips stream with
+Range support so Safari/iPhone can play them.
+
+The GPU is shared, not split: for each video h3-engine runs `llm-engine h3` (stop Strata/Ollama,
+remember which one had the card, take `h3-awake.service` so the PC cannot sleep mid-render) and
+`llm-engine restore` a few minutes after the last video. `llm-engine` refuses any switch while a
+video renders, and choosing an engine under Manage ends the loan early. `pc-setup/sudoers-h3-engine`
+lets the desktop user run exactly those three commands.
 
 ## Monitors off, machine on
 
@@ -256,4 +270,5 @@ These each cost real debugging time.
 | `Dockerfile` | `python:3.12-alpine` + `openssh-client` |
 | `docker-compose.yml` | Host networking, `.env`, ssh + state volumes |
 | `.env.example` | Annotated settings template |
-| `pc-setup/` | What goes *on the monitored PC* for RGB control |
+| `pc-setup/` | What goes *on the monitored PC*: RGB control, `llm-engine`, Strata and H3 units, sudoers |
+| `ui/web/video.js` | The Video tab |
