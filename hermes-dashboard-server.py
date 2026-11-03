@@ -95,7 +95,8 @@ for c in /sys/class/drm/card*/device; do
   echo "vram_used=$(cat $c/mem_info_vram_used 2>/dev/null)"
   echo "vram_total=$(cat $c/mem_info_vram_total 2>/dev/null)"
   for h in $c/hwmon/hwmon*/; do
-    echo "gpu_temp=$(cat ${h}temp1_input 2>/dev/null)"
+    # Hottest sensor, not temp1 (edge): edge reads ~55 °C while junction is at 93.
+    echo "gpu_temp=$(cat ${h}temp*_input 2>/dev/null | sort -n | tail -1)"
     echo "gpu_power=$(cat ${h}power1_average 2>/dev/null)"
     echo "gpu_power_cap=$(cat ${h}power1_cap 2>/dev/null)"
     echo "gpu_fan=$(cat ${h}fan1_input 2>/dev/null)"
@@ -106,7 +107,8 @@ awk '/MemTotal/{print "mem_total="$2} /MemAvailable/{print "mem_avail="$2}' /pro
 echo "cpu_energy=$(cat /sys/class/powercap/intel-rapl:0/energy_uj 2>/dev/null)"
 echo "cpu_energy_max=$(cat /sys/class/powercap/intel-rapl:0/max_energy_range_uj 2>/dev/null)"
 for h in /sys/class/hwmon/hwmon*/; do
-  [ "$(cat $h/name 2>/dev/null)" = "k10temp" ] && echo "cpu_temp=$(cat ${h}temp1_input 2>/dev/null)" && break
+  # Hottest of Tctl and the per-CCD dies, not just temp1.
+  [ "$(cat $h/name 2>/dev/null)" = "k10temp" ] && echo "cpu_temp=$(cat ${h}temp*_input 2>/dev/null | sort -n | tail -1)" && break
 done
 echo "cpu_freq=$(awk '{s+=$1;n++} END{if(n)printf "%d", s/n}' /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null)"
 echo "cpu_stat=$(head -1 /proc/stat)"
@@ -1339,6 +1341,32 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass      # the page pressed Stop: dropping the upstream ends the run there too
 
+    def _strata_metrics(self, url, s):
+        """Strata's /metrics with the GPU temperature swapped for the probe's hottest sensor,
+        so the page shows junction, not edge, whichever engine runs."""
+        req = urllib.request.Request(url)
+        if STRATA_KEY:
+            req.add_header("Authorization", "Bearer " + STRATA_KEY)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                d = json.load(r)
+        except urllib.error.HTTPError as e:
+            return self._send(e.code, e.read() or b"{}", e.headers.get("Content-Type") or "application/json")
+        except Exception as e:
+            return self._err(502, "upstream not reachable: %s" % str(e)[:120])
+        hot = (s.get("pc") or {}).get("temp")
+        hw = d.get("hardware") if isinstance(d.get("hardware"), dict) else None
+        if hot and hw is not None:
+            hw["gpu_temp"] = max(hot, hw.get("gpu_temp") or 0)
+            gpus = hw.get("gpus") or []
+            if len(gpus) == 1 and isinstance(gpus[0], dict):
+                gpus[0]["temp"] = hw["gpu_temp"]
+            with _hist_lock:
+                mine = list(_hist["gpu_temp"])
+            if isinstance(d.get("history"), dict) and any(v for v in mine):
+                d["history"]["gpu_temp"] = mine
+        return self._send(200, d)
+
     def _builder(self, method, path, query, raw):
         """/api/builder/<x> -> strata-agent's /api/<x> (health -> /health). Event streams are relayed live."""
         if not BUILDER_URL:
@@ -1470,6 +1498,8 @@ class Handler(BaseHTTPRequestHandler):
         s = _snap()
         if strata_up(s):
             url = STRATA_URL + "/" + path + (("?" + query) if query else "")
+            if path == "metrics" and method == "GET":
+                return self._strata_metrics(url, s)
             return self._proxy(url, method, raw if method == "POST" else None, STRATA_KEY)
         if path in ("health", "api/health"):
             return self._send(200, synth_health(s))
