@@ -128,6 +128,7 @@
     const models = Object.entries(pm.models).map(([k, v]) => [k, `${v.label.replace(/ \(.*/, "")} · ~${mmss(v.secs)}`]);
     const note = (pm.models[form.pmodel] || {}).label?.match(/\((.*)\)/)?.[1] || "";
     const canEdit = !!(pm.models[form.pmodel] || {}).edit;
+    const editOnly = !!(pm.models[form.pmodel] || {}).edit_only;
     if (!canEdit) form.image = null;
     root.innerHTML = `
       <span class="card-title">New picture</span>
@@ -138,7 +139,7 @@
         <p class="muted small">${esc(note)}</p></div>
       <div class="vid-field"><span class="vid-label">Shape</span>${seg("vid-paspect", P_ASPECTS.map(([k, l]) => [k, l, (pm.sizes[k] || []).join("×")]), form.paspect)}</div>
       <div class="vid-field" ${canEdit ? "" : "hidden"}>
-        <span class="vid-label">Change a picture (optional)</span>
+        <span class="vid-label">${editOnly ? "Picture to change" : "Change a picture (optional)"}</span>
         <div class="vid-pic">${form.image ? `<img src="${form.image}" alt="">` : ""}
           <button type="button" class="st-btn st-btn--secondary" id="vid-pick">${icon("image")}${form.image ? "Change" : "Choose a picture"}</button>
           ${form.image ? `<button type="button" class="st-btn st-btn--icon" id="vid-unpick" title="Remove the picture" aria-label="Remove the picture">${icon("trash")}</button>` : ""}
@@ -376,6 +377,8 @@
     if (sending || !presets) return;
     const prompt = $("vid-prompt").value.trim();
     if (!prompt) { $("vid-prompt").focus(); return say("warn", "Write a prompt first"); }
+    if (form.kind === "picture" && (presets.pictures?.models?.[form.pmodel] || {}).edit_only && !form.image)
+      return say("warn", "Choose a picture", "Fibo 2.0 Edit changes an existing picture.");
     if (form.kind === "video" && form.mode !== "text" && !form.image) return say("warn", "Choose a picture", form.mode === "ref" ? "Reference mode needs one." : "Start-picture mode needs one.");
     sending = true; renderForm();
     try {
