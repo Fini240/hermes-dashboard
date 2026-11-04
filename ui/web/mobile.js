@@ -77,4 +77,27 @@
     });
   }
   update();
+
+  // Phones (600 px and less): the tabs leave the header for a bottom bar, under the views (dash.css). The same
+  // buttons move, so app.js' handlers and aria stay as they are.
+  const tabs = document.querySelector(".st-tabs"), brand = document.querySelector(".st-header__brand");
+  const phone = matchMedia("(max-width: 600px)");
+  function placeTabs() {
+    const bottom = phone.matches;
+    if (bottom && !tabs.classList.contains("st-tabs--bottom")) document.querySelector("main").after(tabs);
+    else if (!bottom && tabs.classList.contains("st-tabs--bottom")) brand.after(tabs);
+    tabs.classList.toggle("st-tabs--bottom", bottom);
+    document.body.classList.toggle("has-bottom-tabs", bottom);
+  }
+  phone.addEventListener("change", placeTabs);
+  placeTabs();
+  // the on-screen keyboard is up while a text field has focus on a touch screen: the bar steps aside
+  const typing = (el) => !!el && (el.tagName === "TEXTAREA" || el.tagName === "SELECT" ||
+    (el.tagName === "INPUT" && !/^(checkbox|radio|range|button|submit|file|color)$/i.test(el.type)));
+  document.addEventListener("focusin", (e) => {
+    if (typing(e.target) && matchMedia("(pointer: coarse)").matches) { root.setAttribute("data-kb", ""); schedule(); }
+  });
+  document.addEventListener("focusout", () => {
+    setTimeout(() => { if (!typing(document.activeElement)) { root.removeAttribute("data-kb"); schedule(); } }, 0);
+  });
 })();

@@ -62,7 +62,7 @@ body { padding-left: env(safe-area-inset-left); padding-right: env(safe-area-ins
 @media (max-width: 640px) {
   .st-header { height: calc(54px + env(safe-area-inset-top)); padding-top: env(safe-area-inset-top); }
   .st-header__brand { font-size: var(--st-fs-base); }
-  /* four tabs as icons: the labels do not fit beside the name at 390 px */
+  /* the tabs as icons: the labels do not fit beside the name (601-640 px; below that they move to the bottom bar) */
   .st-tab { font-size: 0; gap: 0; padding: 0 11px; height: 38px; }
   .st-tab .st-icon { display: inline-block !important; width: 20px; height: 20px; }
   .st-header .st-pill { padding: 0 9px; }
@@ -124,6 +124,8 @@ body { padding-left: env(safe-area-inset-left); padding-right: env(safe-area-ins
 .voice-pop label.voice-check input { margin: 0; accent-color: var(--st-accent); }
 
 /* ---------- header pill: no data / asleep (app.js pcState) */
+.st-pill[data-state="ready"] .st-pill__dot { background: var(--st-accent); }
+.st-pill[data-state="busy"] .st-pill__dot { background: var(--st-warn); }
 .st-pill[data-state="error"] .st-pill__dot { background: var(--st-danger); }
 .st-pill[data-state="off"] .st-pill__dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--st-ink-muted); }
 
@@ -134,4 +136,25 @@ body { padding-left: env(safe-area-inset-left); padding-right: env(safe-area-ins
 @media (max-width: 600px) {
   .req-card .col-opt { display: none; }
   .req-card .st-table th, .req-card .st-table td { padding: 10px 8px; }
+}
+
+/* ---------- phones: the five tabs as a bottom bar (mobile.js moves the nav below <main>), icon over a short label.
+   It is a flex item under the views, so nothing scrolls behind it and the composer sits right above it. While the
+   on-screen keyboard is up (a field has focus on a touch screen) it steps aside. */
+@media (max-width: 600px) {
+  .st-tabs.st-tabs--bottom { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 2px; flex: none; margin: 0;
+    padding: 4px 6px calc(4px + env(safe-area-inset-bottom)); background: var(--st-surface); border: 0;
+    border-top: 1px solid var(--st-line); border-radius: 0; position: relative; z-index: 2; }
+  .st-tabs--bottom .st-tab { flex-direction: column; justify-content: center; gap: 3px; height: 52px; padding: 0; min-width: 0;
+    font-size: 11px; font-weight: var(--st-fw-medium); line-height: 1; border-radius: 10px; }
+  .st-tabs--bottom .st-tab .st-icon { display: block !important; width: 22px; height: 22px; }
+  .st-tabs--bottom .st-tab[aria-selected="true"] { background: var(--st-surface-2); box-shadow: none; font-weight: var(--st-fw-bold); }
+  html[data-kb] .st-tabs--bottom { display: none; }
+  /* the bar carries the bottom safe area now; the composer and the toasts sit above it */
+  html:not([data-kb]) body.has-bottom-tabs .composer-wrap { padding-bottom: var(--st-s-2); }
+  body.has-bottom-tabs .st-toasts { bottom: calc(72px + env(safe-area-inset-bottom)); }
+  .st-header .st-pill { max-width: 46vw; }
+  .state-detail { flex-basis: 100%; }
+  .state-act { margin-left: 0; }
+  #pill-short { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 }

@@ -18,7 +18,8 @@
 .vid{max-width:1240px;width:100%;margin:0 auto;padding:var(--st-s-6);display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);gap:var(--st-s-4);align-items:start}
 .vid .st-card{display:flex;flex-direction:column;gap:var(--st-s-3);min-width:0}
 .vid p{margin:0}
-.vid-form{position:sticky;top:0}
+/* the form keeps to the window and scrolls inside itself, so its submit row (sticky at its bottom) is always in reach */
+.vid-form{position:sticky;top:var(--st-s-4);max-height:calc(100dvh - 60px - 2 * var(--st-s-6));overflow-y:auto;overscroll-behavior:contain}
 .vid-field{display:flex;flex-direction:column;gap:6px}
 .vid-label{font-size:var(--st-fs-sm);font-weight:500;color:var(--st-ink-soft)}
 .vid textarea{min-height:120px;resize:vertical;padding:10px 14px;border-radius:var(--st-r-md);border:1.5px solid var(--st-line);background:var(--st-surface);color:var(--st-ink);font:400 var(--st-fs-md)/1.5 var(--st-font)}
@@ -35,7 +36,14 @@
 .vid-pic .st-btn{flex:none}
 .vid details summary{cursor:pointer;font-size:var(--st-fs-sm);color:var(--st-ink-soft)}
 .vid details[open] summary{margin-bottom:var(--st-s-3)}
-.vid-go{display:flex;gap:var(--st-s-3);align-items:center;flex-wrap:wrap}
+.vid-go{display:flex;gap:var(--st-s-3);align-items:center;flex-wrap:wrap;position:sticky;bottom:calc(-1 * var(--st-s-5));z-index:1;
+  margin:0 calc(-1 * var(--st-s-5)) calc(-1 * var(--st-s-5));padding:var(--st-s-3) var(--st-s-5) var(--st-s-5);
+  background:var(--st-surface);border-top:1px solid var(--st-line-soft);border-radius:0 0 var(--st-r-lg) var(--st-r-lg)}
+/* Quality / Shape and Size / Length side by side where both fit */
+.vid-pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:var(--st-s-3)}
+.vid-pair #vid-size button{height:auto;min-height:34px;padding:5px 6px;line-height:1.2}
+.vid-pair #vid-size button small{display:block;margin-top:1px}
+@media (min-width:1200px){.vid{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}
 .vid-go .st-btn--primary{min-width:150px}
 .vid-est{font-size:var(--st-fs-sm);color:var(--st-ink-soft);flex:1;min-width:160px}
 .vid-gpu{display:flex;gap:10px;align-items:flex-start;font-size:var(--st-fs-sm);color:var(--st-ink-soft)}
@@ -59,7 +67,8 @@
 .vid-empty{color:var(--st-ink-muted);font-size:var(--st-fs-sm)}
 @media (max-width:900px){
   .vid{grid-template-columns:minmax(0,1fr);padding:var(--st-s-4) 16px}
-  .vid-form{position:static}
+  .vid-form{position:static;max-height:none;overflow:visible}
+  .vid-go{bottom:0}
   .vid-two{grid-template-columns:1fr}
 }
 /* phones: Size and Shape keep one row; each button puts its pixel size under its name */
@@ -151,11 +160,11 @@
           <input class="st-input" id="vid-seed" type="number" min="1" step="1" placeholder="Random" value="${esc(form.seed)}">
           <span class="muted small">Same seed + same settings = the same picture.</span></div>
       </details>
+      <div class="vid-gpu" id="vid-gpu"></div>
       <div class="vid-go">
         <button type="button" class="st-btn st-btn--primary" id="vid-go" ${sending ? "disabled" : ""}>${icon("image")}${sending ? "Sending…" : "Make picture"}</button>
         <span class="vid-est" id="vid-est"></span>
-      </div>
-      <div class="vid-gpu" id="vid-gpu"></div>`;
+      </div>`;
     wireForm();
     paintEstimate();
     paintGpu();
@@ -184,11 +193,15 @@
       </div>
       <div class="vid-field"><label class="vid-label" for="vid-prompt">Prompt</label>
         <textarea id="vid-prompt" maxlength="4000" placeholder="A red fox trots through falling snow at dusk, cinematic. Soft crunching footsteps and wind.">${esc(keepPrompt)}</textarea></div>
-      <div class="vid-field"><span class="vid-label">Quality</span>${seg("vid-quality", quals, form.quality)}
-        ${form.quality === "fast" ? `<p class="muted small">Draft: a quick look at the idea. Fine details like text, faces or small figures can change from frame to frame.</p>` : ""}</div>
-      <div class="vid-field"><span class="vid-label">Shape</span>${seg("vid-aspect", ASPECTS, form.aspect)}</div>
-      <div class="vid-field"><span class="vid-label">Size</span>${seg("vid-size", sizes, form.size)}</div>
-      <div class="vid-field"><span class="vid-label">Length</span>${seg("vid-length", lengths, form.length, (v) => presets.lengths[v] > maxFrames(form.size))}</div>
+      <div class="vid-pair">
+        <div class="vid-field"><span class="vid-label">Quality</span>${seg("vid-quality", quals, form.quality)}</div>
+        <div class="vid-field"><span class="vid-label">Shape</span>${seg("vid-aspect", ASPECTS, form.aspect)}</div>
+      </div>
+      ${form.quality === "fast" ? `<p class="muted small">Draft: a quick look at the idea. Fine details like text, faces or small figures can change from frame to frame.</p>` : ""}
+      <div class="vid-pair">
+        <div class="vid-field"><span class="vid-label">Size</span>${seg("vid-size", sizes, form.size)}</div>
+        <div class="vid-field"><span class="vid-label">Length</span>${seg("vid-length", lengths, form.length, (v) => presets.lengths[v] > maxFrames(form.size))}</div>
+      </div>
       <details id="vid-adv" ${store.get("vid.adv", "") ? "open" : ""}><summary>More settings</summary>
         <div class="vid-two">
           <div class="vid-field"><label class="vid-label" for="vid-seed">Seed</label>
@@ -199,11 +212,11 @@
         </div>
         <p class="muted small" style="margin-top:8px">${esc(qnote)}. Reference mode always uses 8 steps.</p>
       </details>
+      <div class="vid-gpu" id="vid-gpu"></div>
       <div class="vid-go">
         <button type="button" class="st-btn st-btn--primary" id="vid-go" ${sending ? "disabled" : ""}>${icon("film")}${sending ? "Sending…" : "Make video"}</button>
         <span class="vid-est" id="vid-est"></span>
-      </div>
-      <div class="vid-gpu" id="vid-gpu"></div>`;
+      </div>`;
     wireForm();
     paintEstimate();
     paintGpu();
@@ -459,9 +472,11 @@
 
   // ---------------------------------------------------------------- polling
   let refreshSeq = 0;       // an older answer that arrives after a newer one is dropped
+  let refreshedAt = 0;
   async function refresh() {
     clearTimeout(timer);
     const mine = ++refreshSeq;
+    refreshedAt = Date.now();
     try {
       const d = await api("GET", "jobs");
       if (mine !== refreshSeq) return;
@@ -483,12 +498,18 @@
       if (!presets && $("vid-form")) delete $("vid-form").dataset.ready;
     }
     if (shown) render();
+    window.dispatchEvent(new CustomEvent("dash:video"));      // app.js: the pill shows the render's progress
     const active = jobs.some((j) => j.status === "queued" || j.status === "running");
     // fast while something renders; otherwise slow, and not at all while the tab is hidden and idle
     const next = active ? (shown ? 2000 : 8000) : (shown ? 15000 : 0);
     clearTimeout(timer);
     if (next) timer = setTimeout(refresh, document.hidden ? Math.max(next, 15000) : next);
   }
+
+  // the running job, for app.js' pill and status bar
+  window.dashVideo = {running: () => jobs.find((j) => j.status === "running") || null};
+  // app.js sees H3 rendering in /api/stats before this list knows the job (started from elsewhere): look now
+  window.addEventListener("dash:video-poll", () => { if (Date.now() - refreshedAt > 5000) refresh(); });
 
   const prevShown = window.manageShown;
   window.manageShown = (t) => {

@@ -91,6 +91,30 @@
 .chat-model-status{font-size:var(--st-fs-xs);color:var(--st-ink-muted);overflow-wrap:anywhere;padding:4px 8px}
 .chat-model-status:empty{display:none}
 @media(max-width:640px){.chat-model-trigger{flex:1;max-width:190px;height:34px;padding:0 8px}.st-composer__bar .spacer{display:none}}
+.chat-model-list{min-height:96px}
+/* Model engine: one tile per engine with what it is for; Video (H3) shows only while it holds the GPU */
+.mg-opts{display:flex;flex-direction:column;gap:6px}
+.mg-opt{display:grid;grid-template-columns:auto 1fr;align-items:center;column-gap:8px;row-gap:4px;padding:10px 12px;border:1.5px solid var(--st-line);border-radius:var(--st-r-md);background:var(--st-surface);color:var(--st-ink);text-align:left;font:500 var(--st-fs-md)/1.25 var(--st-font);cursor:pointer}
+.mg-opt:hover:not(:disabled){background:var(--st-surface-2)}
+.mg-opt[aria-pressed="true"]{border-color:var(--st-accent);background:var(--st-accent-tint);cursor:default}
+.mg-opt[aria-pressed="true"] .mg-opt__name{font-weight:700}
+.mg-opt:disabled{opacity:.45;cursor:not-allowed}
+.mg-opt[data-eng="h3"]:disabled{opacity:1;cursor:default}
+.mg-opt[data-eng="h3"][aria-pressed="true"]{border-color:var(--st-warn);background:var(--st-warn-tint)}
+.mg-opt__sub{grid-column:2;font-size:var(--st-fs-xs);font-weight:400;color:var(--st-ink-muted)}
+.mg-btn.danger:not(.armed){color:var(--st-danger-text);border-color:var(--st-danger)}
+.mg-btn.danger:not(.armed):hover:not(:disabled){background:var(--st-danger-tint)}
+/* Hermes tokens: the four numbers people look at, the rest folded away */
+.mg-tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:var(--st-s-3)}
+.mg-tile{display:flex;flex-direction:column;gap:4px;padding:12px 14px;border:1px solid var(--st-line-soft);border-radius:var(--st-r-md);background:var(--st-surface-2);min-width:0}
+.mg-tile span{font-size:var(--st-fs-xs);color:var(--st-ink-muted)}
+.mg-tile strong{font-size:var(--st-fs-xl);font-weight:900;line-height:1.1;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.mg-tok-more .st-collapse__body{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 var(--st-s-6);font-size:var(--st-fs-md);color:var(--st-ink)}
+.mg-tok-more .st-collapse__body>div{min-width:0}
+.mg-tok-more summary .muted{font-weight:400}
+.mg-tok-more summary .muted:empty{display:none}
+.chat-model-option[aria-disabled="true"] small{color:var(--st-danger-text)}
+@media(max-width:600px){.mg-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.mg-tok-more .st-collapse__body{grid-template-columns:1fr}}
 @media(max-width:860px){.manage{grid-template-columns:1fr;padding:var(--st-s-4)}}`;
   document.head.insertAdjacentHTML("beforeend", `<style>${css}</style>`);
 
@@ -98,40 +122,36 @@
 
   function build() {
     $("manage").innerHTML = `
-      <div class="st-card wide" id="mg-asleep" hidden>
+      <div class="st-card wide" id="mg-asleep" tabindex="-1" hidden>
         <span class="card-title">__PC_NAME__ is asleep or off</span>
         <p class="muted">Chat and the model are not available until it wakes. Waking takes about 10 seconds from sleep.</p>
         <div class="mg-row"><button class="st-btn st-btn--primary" id="mg-wake">${icon("bolt")}Wake __PC_NAME__</button></div>
         <div class="mg-msg" id="mg-wake-msg"></div>
       </div>
-      <div class="st-card">
+      <div class="st-card" id="mg-eng-card" tabindex="-1">
         <span class="card-title">Model engine</span>
-        <div class="mg-row"><div class="mg-seg" id="mg-eng">
-          <button data-eng="ollama"><span class="mg-dot"></span><span>Ollama</span></button>
-          <button data-eng="strata" data-model="qwen3.8-flash-next-q2_0"><span class="mg-dot"></span><span>Strata Q2_0</span></button>
-          <button data-eng="strata" data-model="qwen3.8-flash-next-coder-iq1_m"><span class="mg-dot"></span><span>Strata Coder</span></button></div></div>
-        <p class="muted small">Only one runs at a time — both need the whole GPU. Ollama: the everyday models, fastest
-          overall. Strata Q2_0: the full 125B model. Strata Coder: the smaller coding variant. Loading can take
-          1–3 minutes. Strata keeps the PC awake; switch to Ollama to allow idle sleep.</p>
-        <p class="mg-status" id="mg-eng-h3" hidden><span class="mg-dot warn"></span><span></span></p>
+        <p class="muted small">Only one runs at a time — each needs the whole GPU.</p>
+        <div class="mg-opts" id="mg-eng">
+          <button class="mg-opt" data-eng="ollama"><span class="mg-dot"></span><span class="mg-opt__name">Ollama</span>
+            <small class="mg-opt__sub">Everyday models · fastest · lets the PC sleep when idle</small></button>
+          <button class="mg-opt" data-eng="strata" data-model="qwen3.8-flash-next-q2_0"><span class="mg-dot"></span><span class="mg-opt__name">Strata Q2_0</span>
+            <small class="mg-opt__sub">The full 125B model · loads in 1–3 min · keeps the PC awake</small></button>
+          <button class="mg-opt" data-eng="strata" data-model="qwen3.8-flash-next-coder-iq1_m"><span class="mg-dot"></span><span class="mg-opt__name">Strata Coder</span>
+            <small class="mg-opt__sub">Smaller coding variant · loads in 1–3 min · keeps the PC awake</small></button>
+          <button class="mg-opt" data-eng="h3" disabled hidden aria-pressed="false"><span class="mg-dot"></span><span class="mg-opt__name">Video (H3)</span>
+            <small class="mg-opt__sub" id="mg-h3-sub"></small></button>
+        </div>
         <div class="mg-msg" id="mg-eng-msg"></div>
       </div>
-      <div class="st-card">
-        <span class="card-title">Chat goes to</span>
-        <div class="mg-row"><div class="mg-seg" id="mg-target">
-          <button data-t="model"><span class="mg-dot on"></span><span>Model on the PC</span></button>
-          <button data-t="agent"><span class="mg-dot" id="mg-agent-dot"></span><span>Hermes agent</span></button>
-          <button data-t="builder"><span class="mg-dot" id="mg-builder-dot"></span><span>Builder</span></button></div></div>
-        <p class="muted small" id="mg-target-note"></p>
-      </div>
-      <div class="st-card">
+      <div class="st-card" id="mg-power" tabindex="-1">
         <span class="card-title">Power</span>
         <div class="mg-status"><span class="mg-dot" id="mg-pc-dot"></span><span id="mg-pc-text">–</span></div>
         <div class="mg-row">
           <button class="st-btn st-btn--secondary mg-btn" data-act="suspend">Suspend</button>
           <button class="st-btn st-btn--secondary mg-btn danger" data-act="poweroff">Shut down</button>
-          <button class="st-btn st-btn--secondary" id="mg-mon"><span class="mg-dot"></span><span>Monitors</span></button>
         </div>
+        <div class="toggle-row"><span>Monitors<br><span class="muted small" id="mg-mon-sub">–</span></span>
+          <button class="st-toggle" id="mg-mon" role="switch" aria-checked="false" aria-label="Monitors" disabled></button></div>
         <p class="muted small">Suspend keeps the network card armed, so Wake brings it back; Shut down needs
           wake-on-LAN in the BIOS. Monitors off blanks the displays only — the PC stays awake.</p>
         <div class="mg-msg" id="mg-pw-msg"></div>
@@ -148,13 +168,24 @@
           <button class="st-toggle" id="mg-auto" role="switch" aria-checked="false" aria-label="Automatic lighting"></button></div>
         <div class="mg-msg" id="mg-rgb-msg"></div>
       </div>
+      <div class="st-card" id="mg-settings" tabindex="-1">
+        <span class="card-title">Settings</span>
+        <div class="st-field">
+          <label class="st-label" for="api-key">API key <output>only if the server was started with one</output></label>
+          <input class="st-input" id="api-key" type="password" autocomplete="off" placeholder="Not needed">
+        </div>
+        <p class="muted small">The key, the theme and the sampling settings are kept in this browser; chats are kept on the
+          dashboard server. Light / dark: the button at the top right.
+          <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata on GitHub</a></p>
+      </div>
       <div class="st-card wide" id="mg-tokens" hidden>
         <span class="card-title" id="mg-tok-title">Hermes tokens</span>
-        <div class="manage" style="padding:0;max-width:none" id="mg-tok-body"></div>
+        <div class="mg-tiles" id="mg-tok-tiles"></div>
+        <details class="st-collapse mg-tok-more"><summary>Details <span class="muted" id="mg-tok-sum"></span>
+          ${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body" id="mg-tok-body"></div></details>
       </div>`;
 
-    for (const b of $("mg-eng").querySelectorAll("button")) b.onclick = () => doEngine(b);
-    for (const b of $("mg-target").querySelectorAll("button")) b.onclick = () => chooseTarget(b.dataset.t);
+    for (const b of $("mg-eng").querySelectorAll("button:not([data-eng=h3])")) b.onclick = () => doEngine(b);
     for (const b of document.querySelectorAll(".mg-btn")) b.onclick = () => doPower(b);
     $("mg-mon").onclick = doMonitors;
     for (const b of $("mg-rgb").querySelectorAll("button")) b.onclick = () => post("/api/rgb", {color: b.dataset.c}, "mg-rgb-msg");
@@ -172,10 +203,14 @@
       <div class="chat-model-menu__head"><span id="chat-model-label">Installed models</span>
         <button type="button" class="st-btn st-btn--icon" id="chat-model-refresh" role="menuitem" aria-label="Refresh installed models" title="Refresh installed models">${icon("refresh")}</button></div>
       <div class="chat-model-list" id="chat-model-list" role="group" aria-label="Installed models"></div>
-      <div class="chat-model-menu__foot" id="chat-target"><button type="button" class="chat-model-option" data-t="builder" role="menuitemcheckbox" aria-checked="false">
-        <span class="chat-model-option__label">Builder<small>Builds apps in a project folder on the PC</small></span><span class="chat-model-check" aria-hidden="true">✓</span></button>
-        <button type="button" class="chat-model-option" data-t="agent" role="menuitemcheckbox" aria-checked="false">
-        <span class="chat-model-option__label">Hermes agent<small>Answer with tools and memory</small></span><span class="chat-model-check" aria-hidden="true">✓</span></button></div>
+      <div class="chat-model-menu__foot" id="chat-target" role="group" aria-label="Chat goes to">
+        <div class="chat-model-menu__head"><span>Chat goes to</span></div>
+        <button type="button" class="chat-model-option" data-t="model" role="menuitemradio" aria-checked="false">
+        <span class="chat-model-option__label">Model on the PC<small>Answers directly — fast, no tools</small></span><span class="chat-model-check" aria-hidden="true">✓</span></button>
+        <button type="button" class="chat-model-option" data-t="agent" role="menuitemradio" aria-checked="false">
+        <span class="chat-model-option__label">Hermes agent<small id="chat-agent-sub">Tools, memory and a terminal on the PC</small></span><span class="chat-model-check" aria-hidden="true">✓</span></button>
+        <button type="button" class="chat-model-option" data-t="builder" role="menuitemradio" aria-checked="false">
+        <span class="chat-model-option__label">Builder<small>Builds apps in ~/Projects · needs Strata</small></span><span class="chat-model-check" aria-hidden="true">✓</span></button></div>
       <div class="chat-model-status" id="chat-model-status" role="status"></div></div>`);
     $("chat-model").onclick = () => toggleModels($("chat-model-menu").hidden);
     $("chat-model").onkeydown = (e) => {
@@ -192,9 +227,7 @@
       toggleModels(false, true); paintModels(); paintTarget();
       if (typeof saveChat === "function") saveChat();
     };
-    for (const b of $("chat-target").querySelectorAll("button")) b.onclick = () => {
-      chooseTarget(target === b.dataset.t ? "model" : b.dataset.t); toggleModels(false, true);
-    };
+    for (const b of $("chat-target").querySelectorAll("button")) b.onclick = () => { chooseTarget(b.dataset.t); toggleModels(false, true); };
     $("chat-model-refresh").onclick = () => loadModels();
     $("chat-model-menu").onkeydown = (e) => {
       const buttons = [...$("chat-model-menu").querySelectorAll("button:not(:disabled)")];
@@ -317,19 +350,9 @@
   window.dashSetTarget = setTarget;   // chats.js: an opened chat brings back who it talked to
   window.dashGetTarget = () => target;
   function paintTarget() {
-    for (const b of document.querySelectorAll("#mg-target button, #chat-target button"))
-      b.setAttribute("aria-pressed", String(b.dataset.t === target));
     for (const b of document.querySelectorAll("#chat-target button")) b.setAttribute("aria-checked", String(target === b.dataset.t));
     paintModels();
-    const sub = $("chat-empty-sub");
-    if (sub && target === "agent") sub.textContent = "Hermes answers with its tools and memory — it can run commands on the PC.";
-    else if (sub && selectedModel) sub.textContent = `${selectedModel} runs on this PC. Nothing leaves it.`;
-    const n = $("mg-target-note");
-    if (n) n.textContent = target === "agent"
-      ? "The Hermes agent on the PC answers, with its tools, memory and terminal. It thinks with the model on the PC (Strata or Ollama)."
-      : target === "builder"
-      ? "Builder — your own coding agent on the PC — works in a project folder (~/Projects): it writes files, runs commands and serves apps. It needs Strata as the engine. A run keeps going when you close the page."
-      : "The model on the PC answers directly — fast, no tools. Strata or Ollama, whichever holds the GPU.";
+    if (D() && D().paintEmpty) D().paintEmpty();      // the chat's empty line follows who answers (Builder writes its own)
     if (window.dashBuilder) window.dashBuilder.targetChanged();
   }
 
@@ -385,8 +408,10 @@
   async function doMonitors() {
     const b = $("mg-mon"); if (b.disabled) return;
     monBusy = Date.now();
-    b.querySelector("span:last-child").textContent = b.dataset.state === "off" ? "Turning on…" : "Turning off…";
-    await post("/api/display", {action: b.dataset.state === "off" ? "on" : "off"}, "mg-pw-msg");
+    const on = b.dataset.state === "off";
+    b.setAttribute("aria-checked", String(on));
+    $("mg-mon-sub").textContent = on ? "turning on…" : "turning off…";
+    await post("/api/display", {action: on ? "on" : "off"}, "mg-pw-msg");
   }
   async function doWake() {
     const b = $("mg-wake"); b.disabled = true;
@@ -423,38 +448,45 @@
     const ek = asleep ? "asleep" : engineKey(s);
     if (lastEngineKey !== null && ek !== lastEngineKey) window.dispatchEvent(new CustomEvent("dash:engine", {detail: e || null}));
     lastEngineKey = ek;
-    gpuNote = asleep ? "__PC_NAME__ is asleep" : e && e.active === "h3" ? "GPU busy: making a video"
+    gpuNote = asleep ? "__PC_NAME__ is asleep" : e && e.active === "h3" ? (e.state === "rendering" ? "GPU busy: making a video" : "GPU held by the video engine")
       : e && e.active == null && e.state === "none" ? "No engine: pick one under Manage" : "";
     engineLoading = e?.active === "strata" && (e.state === "loading" || e.state === "error");
     strataModels = s.strata_models || strataModels;
-    if (!engBusy) for (const b of $("mg-eng").querySelectorAll("button")) {
+    if (!engBusy) for (const b of $("mg-eng").querySelectorAll("button:not([data-eng=h3])")) {
       const name = b.dataset.eng === "strata" ? (b.dataset.model.endsWith("q2_0") ? "Strata Q2_0" : "Strata Coder") : "Ollama";
       const on = !!e && e.active === b.dataset.eng && (!b.dataset.model || e.model === b.dataset.model);
       b.disabled = !e || engineSwitching || (typeof busy !== "undefined" && !!busy)
         || (b.dataset.eng === "strata" && !strataModels.some((m) => m.id === b.dataset.model));
       b.setAttribute("aria-pressed", String(on));
       b.querySelector(".mg-dot").className = "mg-dot" + (on ? (e.state === "loading" || e.state === "error" ? " warn" : " on") : "");
-      b.querySelector("span:last-child").textContent = on ? `${name} · ${ENG[e.state] || e.state}` : name;
+      b.querySelector(".mg-opt__name").textContent = on ? `${name} · ${ENG[e.state] || e.state}` : name;
     }
-    const h3 = $("mg-eng-h3");
-    h3.hidden = !(e && e.active === "h3");
-    if (!h3.hidden) h3.lastChild.textContent = e.state === "rendering"
-      ? "Video (H3) has the GPU and is rendering — switching now is refused until it is done (or cancel it on the Video tab)."
-      : "Video (H3) holds the GPU for quick follow-ups and gives it back by itself. Pick an engine to take it back now.";
+    // H3 is no choice here (a video borrows the GPU by itself): shown, lit and not clickable while it holds the GPU
+    const h3 = $("mg-eng").querySelector("[data-eng=h3]"), h3on = !!e && e.active === "h3";
+    h3.hidden = !h3on;
+    h3.setAttribute("aria-pressed", String(h3on));
+    h3.querySelector(".mg-dot").className = "mg-dot" + (h3on ? " warn" : "");
+    h3.querySelector(".mg-opt__name").textContent = h3on ? `Video (H3) · ${e.state === "rendering" ? "rendering" : "idle"}` : "Video (H3)";
+    $("mg-h3-sub").textContent = !h3on ? "" : e.state === "rendering"
+      ? "Making a video — switching waits until it is done (or cancel it in the Studio)"
+      : "Holds the GPU for quick follow-ups and gives it back by itself — pick an engine to take it back now";
     paintModels();
 
-    // chat target: is the agent reachable?
-    $("mg-agent-dot").className = "mg-dot" + (s.agent == null ? "" : s.agent ? " on" : " off");
-    $("mg-agent-dot").title = s.agent == null ? "not configured" : s.agent ? "Hermes is reachable" : "Hermes is not reachable (Mac asleep?)";
+    // chat target: is the agent reachable? (said in the composer's "Chat goes to" list)
+    const as = $("chat-agent-sub"), ab = as && as.closest("button");
+    if (as) {
+      as.textContent = s.agent === false ? "Not reachable right now (Mac asleep?)" : "Tools, memory and a terminal on the PC";
+      ab.setAttribute("aria-disabled", String(s.agent === false));
+    }
 
-    // monitors
+    // monitors: a switch that shows what the displays do now (mixed = some on, some off)
     const mb = $("mg-mon");
     if (!monBusy || Date.now() - monBusy > 2500) {
       monBusy = 0;
       const m = s.monitors;
       mb.dataset.state = m || "na"; mb.disabled = !m;
-      mb.querySelector(".mg-dot").className = "mg-dot" + (m === "on" ? " on" : m === "mixed" ? " warn" : "");
-      mb.querySelector("span:last-child").textContent = !m ? "Monitors n/a" : m === "off" ? "Monitors off" : m === "mixed" ? "Monitors mixed" : "Monitors on";
+      mb.setAttribute("aria-checked", String(m === "on" || m === "mixed"));
+      $("mg-mon-sub").textContent = !m ? "not available (PC off, Windows, or no display)" : m === "off" ? "off" : m === "mixed" ? "some on, some off" : "on";
     }
 
     // lighting
@@ -473,15 +505,19 @@
       if (s.tokens_age != null && s.tokens_age > 90) { const m = Math.round(s.tokens_age / 60); age = ` · from the Mac ${m < 60 ? m + " min" : Math.round(m / 60) + " h"} ago`; }
       $("mg-tok-title").textContent = "Hermes tokens" + age;
       const kv = (k, v) => `<div class="mg-kv"><span>${esc(k)}</span><span class="v">${v}</span></div>`;
+      const tile = (k, v) => `<div class="mg-tile"><span>${esc(k)}</span><strong>${v}</strong></div>`;
       const c = t.current;
-      let h = `<div>${kv("Input", num(t.in))}${kv("Output", num(t.out))}${kv("Cached", num(t.cache_read))}` +
-              `${t.reasoning ? kv("Reasoning", num(t.reasoning)) : ""}${kv("API calls", fmt(t.calls))}${kv("Sessions", t.sessions)}</div>`;
+      const tiles = tile("Input", num(t.in)) + tile("Output", num(t.out)) + tile("API calls", fmt(t.calls)) +
+                    tile("Last activity", c && c.idle != null ? `${dur(c.idle)} ago` : "–");
+      if ($("mg-tok-tiles").innerHTML !== tiles) $("mg-tok-tiles").innerHTML = tiles;
+      $("mg-tok-sum").textContent = `${fmt(t.sessions)} sessions · ${(t.models || []).length} models`;
+      let h = `<div>${kv("Cached", num(t.cache_read))}${t.reasoning ? kv("Reasoning", num(t.reasoning)) : ""}${kv("Sessions", t.sessions)}` +
+              `${(t.models || []).slice(0, 4).map((x) => kv(x.name, `${num(x.out)} out · ${x.calls} calls`)).join("")}</div>`;
       const sid = String(c ? c.id : "");
       const shortId = sid.length > 16 ? `${sid.slice(0, 10)}…${sid.slice(-4)}` : sid;
       h += `<div>${c ? kv("Current session", `<code title="${esc(sid)}">${esc(shortId)}</code>`) + kv("Model", `<code>${esc(c.model)}</code>`) +
-            kv("In / Out", `${num(c.in)} / ${num(c.out)}`) + kv("Last activity", `${dur(c.idle)} ago`) : ""}` +
-           `${(t.models || []).slice(0, 4).map((x) => kv(x.name, `${num(x.out)} out · ${x.calls} calls`)).join("")}</div>`;
-      $("mg-tok-body").innerHTML = h;
+            kv("In / Out", `${num(c.in)} / ${num(c.out)}`) : ""}</div>`;
+      if ($("mg-tok-body").dataset.h !== h) { $("mg-tok-body").innerHTML = h; $("mg-tok-body").dataset.h = h; }
     }
   }
 
@@ -493,17 +529,21 @@
     speed: "Speed", gpu: "GPU load", vram: "VRAM", temp: "GPU temp", sysw: "System draw", cpu: "CPU",
     cputemp: "CPU temp", ram: "RAM", power: "GPU power", fan: "GPU fan", disk: "Disk read", pcie: "PCIe"};
   const EXTRA = {
-    sysw: {icon: "bolt", max: 750}, cputemp: {icon: "thermometer", max: 95, tone: "warn"},
+    sysw: {icon: "bolt", max: 750}, cputemp: {icon: "thermometer", max: 95},
     ram: {icon: "memory", max: 100}, fan: {icon: "activity", max: 3300, tone: "info"}};
+  // the Monitor's two headings; a card moves only within its own (order and drag stay per group)
+  const GROUPS = {gpu: "GPU", sys: "System"};
+  const GROUP = {speed: "gpu", gpu: "gpu", vram: "gpu", temp: "gpu", power: "gpu", fan: "gpu", pcie: "gpu",
+                 cpu: "sys", cputemp: "sys", ram: "sys", sysw: "sys", disk: "sys"};
   // the server's history series for each extra card (/metrics history); the local buffer H only stands in
   // for an older server that does not send them
   const SERIES = {sysw: "total_watts", cputemp: "cpu_temp", ram: "ram_pct", fan: "gpu_fan"};
   const MIN = {cputemp: 30};
-  const SECTIONS = {state: ["Model state", ".state-card"], ctx: ["Context and memory", ".ctx-card"],
+  const SECTIONS = {state: ["Status", ".state-card"], ctx: ["Context and memory", ".ctx-card"],
                     req: ["Recent requests", ".req-card"], cc: ["Conversation cache", "#cc-card"]};
   // PCIe stays empty on AMD cards (Strata reads it through NVML), so it starts hidden; GPU power is folded into
   // System draw's line, disk reads matter only when experts stream from the SSD.
-  const DEFAULT_LAYOUT = {order: ["speed", "gpu", "vram", "temp", "sysw", "cpu", "cputemp", "ram", "power", "fan", "disk", "pcie"],
+  const DEFAULT_LAYOUT = {order: ["speed", "gpu", "vram", "temp", "power", "fan", "pcie", "cpu", "cputemp", "ram", "sysw", "disk"],
                           hidden: ["power", "fan", "disk", "pcie"], sections: {state: true, ctx: true, req: true, cc: true}};
   let layout;
   try { layout = JSON.parse(store.get("dash.monitor-layout", "null")); } catch (e) { layout = null; }
@@ -514,6 +554,9 @@
     const order = [...new Set(l.order.filter((k) => k in CARDS))];
     const hidden = [...new Set((Array.isArray(l.hidden) ? l.hidden : fresh.hidden).filter((k) => k in CARDS))];
     for (const k of Object.keys(CARDS)) if (!order.includes(k)) { order.push(k); if (!hidden.includes(k)) hidden.push(k); }
+    // a layout from before the groups: the GPU cards first, then the System ones, each in its saved order
+    const g = Object.keys(GROUPS);
+    order.sort((a, b) => g.indexOf(GROUP[a]) - g.indexOf(GROUP[b]));
     const sections = Object.assign({}, fresh.sections);
     if (l.sections && typeof l.sections === "object") for (const k of Object.keys(SECTIONS)) if (k in l.sections) sections[k] = !!l.sections[k];
     return {order, hidden, sections};
@@ -524,10 +567,10 @@
 
   function cardEl(key) { const v = $(`mv-${key}`); return v ? v.closest(".metric-card") : null; }
   function buildExtraCards() {
-    const grid = $("metrics"); if (!grid) return;
+    if (!$("metrics")) return;
     for (const [key, x] of Object.entries(EXTRA)) {
       if ($(`mv-${key}`)) continue;
-      grid.insertAdjacentHTML("beforeend", `<div class="st-card metric-card"><div class="st-metric">
+      $(`metrics-${GROUP[key]}`).insertAdjacentHTML("beforeend", `<div class="st-card metric-card"><div class="st-metric">
         <span class="st-metric__label">${icon(x.icon)}${esc(CARDS[key])}</span>
         <span class="st-metric__value" id="mv-${key}">–</span><span class="st-metric__sub" id="ms-${key}"></span>
         <svg class="st-metric__spark" id="sp-${key}" viewBox="0 0 100 32" preserveAspectRatio="none"${x.tone ? ` data-tone="${x.tone}"` : ""}>
@@ -538,6 +581,11 @@
   }
   function applyLayout() {
     layout.order.forEach((k, i) => { const c = cardEl(k); if (c) { c.style.order = i; c.classList.toggle("dash-off", layout.hidden.includes(k)); } });
+    // a heading whose cards are all hidden goes with them
+    for (const g of Object.keys(GROUPS)) {
+      const el = $(`mgroup-${g}`);
+      if (el) el.classList.toggle("dash-off", layout.order.every((k) => GROUP[k] !== g || layout.hidden.includes(k)));
+    }
     for (const [k, [, sel]] of Object.entries(SECTIONS)) { const el = document.querySelector(sel); if (el) el.classList.toggle("dash-off", !layout.sections[k]); }
     const row = document.querySelector(".monitor-row");
     if (row) row.classList.toggle("dash-single", !layout.sections.ctx || !layout.sections.req);
@@ -580,15 +628,15 @@
     push("fan", p.fan);
     for (const [k, x] of Object.entries(EXTRA)) {
       const server = hist[SERIES[k]];
-      spark(k, Array.isArray(server) ? server : H[k], x.max, MIN[k]);
+      spark(k, Array.isArray(server) ? server : H[k], x.max, MIN[k], k === "cputemp" ? D().TEMP_BANDS.cpu : null);
     }
   }
-  const spark = (k, values, max, min) => { if (D() && $(`sp-${k}`)) D().spark(`sp-${k}`, values, max, min || 0); };
+  const spark = (k, values, max, min, bands) => { if (D() && $(`sp-${k}`)) D().spark(`sp-${k}`, values, max, min || 0, bands); };
   function buildLayoutCard() {
     $("manage").insertAdjacentHTML("beforeend", `<div class="st-card wide" id="mg-layout">
       <div class="mg-row" style="justify-content:space-between"><span class="card-title">Monitor layout</span>
         <button class="st-btn st-btn--secondary" id="mg-layout-reset">Reset</button></div>
-      <p class="muted small">Tick what the Monitor shows. Drag to reorder — here or straight on the Monitor (on a phone: hold a card, then drag). Kept in this browser.</p>
+      <p class="muted small">Tick what the Monitor shows. Drag to reorder within GPU or System — here or straight on the Monitor (on a phone: hold a card, then drag). Kept in this browser.</p>
       <div class="mg-layout" id="mg-cards"></div>
       <span class="card-title" style="font-size:var(--st-fs-md)">Sections</span>
       <div class="mg-layout" id="mg-sections"></div></div>`);
@@ -597,10 +645,13 @@
   }
   function paintLayoutCard() {
     const chev = (dir) => `<svg class="st-icon st-icon--sm" style="transform:rotate(${dir === "up" ? 180 : 0}deg)"><use href="web/sprite.svg#i-chevron"/></svg>`;
-    $("mg-cards").innerHTML = layout.order.map((k, i) => `<div class="mg-item">
+    // per group: a card moves up or down only next to cards of its own group
+    const same = (i, j) => j >= 0 && j < layout.order.length && GROUP[layout.order[i]] === GROUP[layout.order[j]];
+    $("mg-cards").innerHTML = Object.entries(GROUPS).map(([g, title]) => `<span class="mg-layout__group">${esc(title)}</span>` +
+      layout.order.map((k, i) => GROUP[k] !== g ? "" : `<div class="mg-item">
       <label><input type="checkbox" data-k="${k}"${layout.hidden.includes(k) ? "" : " checked"}> ${esc(CARDS[k])}</label>
-      <span><button class="st-btn st-btn--icon" data-mv="${i}" data-d="-1" aria-label="Move up"${i ? "" : " disabled"}>${chev("up")}</button>
-      <button class="st-btn st-btn--icon" data-mv="${i}" data-d="1" aria-label="Move down"${i < layout.order.length - 1 ? "" : " disabled"}>${chev("down")}</button></span></div>`).join("");
+      <span><button class="st-btn st-btn--icon" data-mv="${i}" data-d="-1" aria-label="Move ${esc(CARDS[k])} up"${same(i, i - 1) ? "" : " disabled"}>${chev("up")}</button>
+      <button class="st-btn st-btn--icon" data-mv="${i}" data-d="1" aria-label="Move ${esc(CARDS[k])} down"${same(i, i + 1) ? "" : " disabled"}>${chev("down")}</button></span></div>`).join("")).join("");
     $("mg-sections").innerHTML = Object.entries(SECTIONS).map(([k, [label]]) => `<div class="mg-item">
       <label><input type="checkbox" data-s="${k}"${layout.sections[k] ? " checked" : ""}> ${esc(label)}</label></div>`).join("");
     for (const c of $("mg-cards").querySelectorAll("input")) c.onchange = () => {
@@ -620,7 +671,7 @@
       return it && container.contains(it) ? keyOf(it) : null; };
     const move = (x, y) => {
       const k = keyAt(x, y);
-      if (!k || k === drag.key) return;
+      if (!k || k === drag.key || GROUP[k] !== GROUP[drag.key]) return;      // within its own group only
       const o = layout.order, from = o.indexOf(drag.key), to = o.indexOf(k);
       o.splice(from, 1); o.splice(to, 0, drag.key);
       applyLayout(); if (container.id === "mg-cards") paintLayoutCard(drag.key);
@@ -674,6 +725,7 @@
 body.dash-drag-active,body.dash-drag-active *{cursor:grabbing!important}
 .monitor-row.dash-single{grid-template-columns:1fr}
 .mg-layout{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:6px 16px}
+.mg-layout__group{grid-column:1/-1;font-size:var(--st-fs-sm);font-weight:700;color:var(--st-ink-soft);margin-top:4px}
 .mg-item{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 4px 4px 10px;border:1px solid var(--st-line-soft);border-radius:10px;font-size:var(--st-fs-md)}
 .mg-item label{display:flex;align-items:center;gap:8px;cursor:pointer}
 .mg-item input{accent-color:var(--st-accent);width:16px;height:16px}

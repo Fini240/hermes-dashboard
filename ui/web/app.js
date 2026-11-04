@@ -74,11 +74,10 @@ function setTheme(t, save) {
   document.documentElement.dataset.theme = t;
   if (save) try { localStorage.setItem("strata.theme", t); } catch (e) { /* ignore */ }
   $("theme-icon").setAttribute("href", `${SPRITE}#i-${t === "dark" ? "sun" : "moon"}`);
-  $("dark-toggle").setAttribute("aria-checked", String(t === "dark"));
 }
+// the header's moon/sun is the one theme control
 const flipTheme = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
 $("theme-btn").onclick = flipTheme;
-$("dark-toggle").onclick = flipTheme;
 setTheme(document.documentElement.dataset.theme || "light", false);
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
   let saved = null;
@@ -110,8 +109,13 @@ function headers(json = false) {
   if (json) h["Content-Type"] = "application/json";
   return h;
 }
-$("api-key").value = store.get("apikey", "");
-$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
+// the key field lives in Manage > Settings, which manage.js builds on DOMContentLoaded (before this listener runs)
+document.addEventListener("DOMContentLoaded", () => {
+  const k = $("api-key");
+  if (!k) return;
+  k.value = store.get("apikey", "");
+  k.onchange = () => { store.set("apikey", k.value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
+});
 
 let health = {model: "strata", images: false, max_context: 0};
 async function loadHealth() {
@@ -119,7 +123,7 @@ async function loadHealth() {
     health = await (await fetch("health", {signal: timeout(8000)})).json();
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
-    $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
+    paintEmpty();
   } catch (e) {
     clearTimeout(healthRetry);
     healthRetry = setTimeout(loadHealth, 2000);
@@ -128,17 +132,20 @@ async function loadHealth() {
 let healthRetry = 0;
 
 // ------------------------------------------------------------------ Monitor
+// group: which heading a card sits under on the Monitor (GPU or System); manage.js adds its four the same way
 const METRICS = [
-  {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
-  {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
-  {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
-  {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
-  {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
-  {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
-  {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
-  {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
+  {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s", group: "gpu"},
+  {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100, group: "gpu"},
+  {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used", group: "gpu"},
+  {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", group: "gpu"},
+  {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power", group: "gpu"},
+  {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info", group: "gpu"},
+  {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100, group: "sys"},
+  {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info", group: "sys"},
 ];
-$("metrics").innerHTML = METRICS.map((m) => `
+// a temperature line turns amber, then red, where it crosses these (°C): GPU junction and CPU package
+const TEMP_BANDS = {gpu: [[85, "warn"], [100, "danger"]], cpu: [[80, "warn"], [90, "danger"]]};
+for (const g of ["gpu", "sys"]) $(`metrics-${g}`).innerHTML = METRICS.filter((m) => m.group === g).map((m) => `
   <div class="st-card metric-card"><div class="st-metric">
     <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
     ${m.key === "speed" ? `<div class="speed-values">
@@ -153,15 +160,20 @@ $("metrics").innerHTML = METRICS.map((m) => `
         <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
         stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
   </div></div>`).join("");
+$("mv-speed").closest(".metric-card").id = "card-speed";
 
 // A sparkline. Nulls are gaps (the PC was off, a sensor did not answer): the path breaks there, and an all-null
-// series draws nothing. The scale runs from `min` to `max` (or the highest value, if higher).
-function spark(id, values, max, min = 0) {
+// series draws nothing. The scale runs from `min` to `max` (or the highest value, if higher). `bands`
+// ([[value, tone], ...], rising) colour the line and its area by height: the part above a value takes its tone.
+function spark(id, values, max, min = 0, bands = null) {
   const svg = $(id);
   if (!svg) return;
   const v = values || [], line = svg.querySelector(".line"), area = svg.querySelector(".area");
   const real = v.filter((x) => x != null && !Number.isNaN(+x)).map(Number);
-  if (v.length < 2 || !real.length) { line.setAttribute("d", ""); area.setAttribute("d", ""); return; }
+  if (v.length < 2 || !real.length) {
+    for (const p of svg.querySelectorAll(".line, .area")) p.setAttribute("d", "");
+    return;
+  }
   const top = Math.max(max || 0, ...real, min + 1e-9), span = top - min;
   const x = (i) => ((i / (v.length - 1)) * 100).toFixed(2);
   const y = (n) => (30 - Math.max(0, Math.min(1, (n - min) / span)) * 26).toFixed(2);
@@ -177,6 +189,18 @@ function spark(id, values, max, min = 0) {
   flush();
   line.setAttribute("d", l);
   area.setAttribute("d", ar);
+  if (bands) bandPaths(svg, id, bands, (n) => +y(n), l, ar);
+}
+// Temperature bands: a copy of the line and its area per band, in the band's tone, clipped to the part above its
+// value. (A gradient would be simpler, but Chrome resolves it in screen space on a non-scaling stroke.)
+function bandPaths(svg, id, bands, y, l, ar) {
+  if (!svg.querySelector(".band")) {
+    svg.insertAdjacentHTML("beforeend", `<defs>${bands.map((_, i) => `<clipPath id="clip-${id}-${i}"><rect x="-2" y="-10" width="104" height="0"/></clipPath>`).join("")}</defs>` +
+      bands.map(([, tone], i) => `<g class="band" clip-path="url(#clip-${id}-${i})" style="color:var(--st-${tone})"><path class="area" fill="currentColor" opacity=".12"/>` +
+        `<path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>`).join(""));
+  }
+  bands.forEach(([value], i) => svg.querySelector(`#clip-${id}-${i} rect`).setAttribute("height", String(Math.max(0, y(value) + 10))));
+  for (const g of svg.querySelectorAll(".band")) { g.querySelector(".line").setAttribute("d", l); g.querySelector(".area").setAttribute("d", ar); }
 }
 function setMetric(key, value, unit, sub) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
@@ -201,7 +225,7 @@ async function poll() {
     if (r.status === 401) {
       keyNeeded = true;
       metricsErr = {status: 401, message: "API key needed"};
-      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
+      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under Manage > Settings.", 6000); }
       dropMetrics();
     } else if (r.ok) {
       keyNeeded = false;
@@ -235,31 +259,78 @@ document.addEventListener("visibilitychange", () => {
 });
 
 const asleepMsg = (e) => !!e && e.status === 503 && /asleep/i.test(e.message || "");
-// what the PC is doing, from /metrics and /api/stats: {state, text, label (for the Model state card)}
+// the engine's name for people: "Strata Q2_0" (its label from /api/stats), "Ollama"
+function engineName(e) {
+  if (!e || e.active !== "strata") return "Ollama";
+  const m = ((stats && stats.strata_models) || []).find((x) => x.id === e.model);
+  return m && m.label ? m.label.replace(/ IQ\w+$/, "") : "Strata";
+}
+const llmRunning = (e) => !!e && (e.active === "strata" || e.active === "ollama");
+// the running H3 job from the Studio's list (video.js), for its progress
+const videoJob = () => (window.dashVideo ? window.dashVideo.running() : null);
+const VIDEO_ACT = {label: "Open Studio", tab: "video"};
+// What the PC is doing, from /metrics, /api/stats and the Studio's job list - the one place that decides it.
+// kind: the situation; state: the dot's colour; text: the header pill; short: the pill on a phone;
+// label + detail: the Monitor's status bar; pct: real progress (0-100) or null; act: where to go about it.
 function pcState() {
   const live = (lastMetrics && lastMetrics.live) || {}, e = (stats && stats.engine) || {};
-  if (keyNeeded) return {state: "error", text: "API key needed"};
+  if (keyNeeded) return {kind: "key", state: "error", text: "API key needed", short: "Key", label: "This server needs an API key",
+                         act: {label: "Add key", tab: "manage", card: "mg-settings"}};
   if ((stats && stats.ok !== false && stats.online === false) || asleepMsg(metricsErr) || live.state === "asleep")
-    return {state: "off", text: "Asleep", label: "__PC_NAME__ is asleep or off"};
+    return {kind: "asleep", state: "off", text: "Asleep", short: "Asleep", label: "__PC_NAME__ is asleep",
+            detail: "waking takes about 10 seconds", act: {label: "Wake", tab: "manage", card: "mg-asleep"}};
   // H3 holds the GPU: rendering, or kept a few minutes for quick follow-ups (chat waits either way)
-  if (live.state === "rendering" || e.active === "h3")
-    return {state: "queued", text: "Making a video", label: e.state === "rendering" || live.state === "rendering"
-      ? "The GPU is making a video" : "The video engine holds the GPU (chat waits until it gives it back)"};
-  if (live.state === "loading" || (e.active === "strata" && e.state === "loading"))
-    return {state: "queued", text: "Loading model", label: "Loading the model"};
-  if (!lastMetrics) {
-    if (!stats && metricsFailures < 3) return {state: "idle", text: "Connecting…", label: "Connecting"};
-    if (metricsFailures >= 3 || !stats) return {state: "error", text: "Server not reachable", label: "No data from the server"};
+  if (live.state === "rendering" || e.active === "h3") {
+    if (live.state === "rendering" || e.state === "rendering") {
+      const j = videoJob(), pct = j && j.progress != null ? Math.round(100 * j.progress) : null;
+      return {kind: "video", state: "busy", text: `Video · rendering${pct != null ? ` ${pct} %` : ""}`, short: "Video",
+              label: `The GPU is making a ${j && j.kind === "picture" ? "picture" : "video"}`, pct,
+              detail: j ? [j.phase || "", j.step && j.steps ? `step ${j.step} of ${j.steps}` : "", pct != null ? `${pct} %` : ""] : "",
+              act: VIDEO_ACT};
+    }
+    return {kind: "video-idle", state: "busy", text: "Video · idle", short: "Video", label: "The video engine holds the GPU — idle",
+            detail: "chat waits until it gives the GPU back", act: {label: "Give GPU back", tab: "manage", card: "mg-eng-card"}};
   }
-  if (e.active === "strata" && e.state === "error") return {state: "error", text: "Model not answering", label: "The model is not answering"};
-  if (live.queued > 0) return {state: "queued", text: `${live.queued} queued`};
+  if (live.state === "loading" || (llmRunning(e) && e.state === "loading"))
+    return {kind: "loading", state: "busy", text: `${e.active === "ollama" ? "Ollama" : "Strata"} · loading`, short: "Loading",
+            label: `Loading ${engineName(e)}…`, detail: e.active === "ollama" ? "" : "usually 1–3 minutes"};
+  if (!lastMetrics) {
+    if (!stats && metricsFailures < 3) return {kind: "connecting", state: "idle", text: "Connecting…", short: "…", label: "Connecting…"};
+    if (metricsFailures >= 3 || !stats)
+      return {kind: "offline", state: "error", text: "Server not reachable", short: "Offline", label: "No data from the server",
+              detail: metricsErr ? metricsErr.message : ""};
+  }
+  const name = engineName(e), who = e.active === "strata" ? "Strata" : e.active === "ollama" ? "Ollama" : "Model";
+  if (e.active === "strata" && e.state === "error")
+    return {kind: "error", state: "error", text: "Strata · not answering", short: "Error", label: `${name} is not answering`,
+            act: {label: "Model engine", tab: "manage", card: "mg-eng-card"}};
+  if (stats && e.active == null && e.state === "none")
+    return {kind: "none", state: "idle", text: "No engine", short: "Idle", label: "No model engine runs",
+            act: {label: "Pick one", tab: "manage", card: "mg-eng-card"}};
+  if (live.queued > 0)
+    return {kind: "queued", state: "queued", text: `${who} · ${live.queued} waiting`, short: "Busy",
+            label: `${name} is busy — ${live.queued} request${live.queued > 1 ? "s" : ""} waiting`};
   if (live.state === "reading") {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
-    return {state: "reading", text: pct != null ? `Reading prompt · ${pct}%` : "Reading prompt"};
+    return {kind: "reading", state: "reading", text: `${who} · reading${pct != null ? ` ${pct} %` : ""}`, short: "Reading",
+            label: `${name} is reading the prompt`, pct,
+            detail: live.prompt_total ? `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens`
+                  : live.prompt_tokens != null ? `${fmt(live.prompt_tokens)} tokens` : ""};
   }
-  if (live.state === "generating") return {state: "generating", text: `Generating · ${fmt(live.tok_s, 1)} tok/s`};
-  if (e.active === null || e.state === "none") return {state: "idle", text: "No engine", label: "No model engine runs"};
-  return {state: "idle", text: "Idle"};
+  if (live.state === "generating") {
+    const verb = live.phase === "thinking" ? "thinking" : "answering";
+    return {kind: "generating", state: "generating", text: `${who} · ${verb}`, short: verb[0].toUpperCase() + verb.slice(1),
+            label: `${name} is ${verb}${live.tok_s != null ? ` · ${fmt(live.tok_s, 1)} t/s` : ""}`,
+            pct: live.max_tokens && live.generated != null ? Math.min(100, (100 * live.generated) / live.max_tokens) : null,
+            detail: live.generated != null ? `${fmt(live.generated)} tokens` : ""};
+  }
+  const last = ((lastMetrics && lastMetrics.requests) || [])[0];
+  const lastText = last && last.decode_tok_s ? `last answer ${fmt(last.output_tokens)} tokens at ${fmt(last.decode_tok_s, 1)} t/s` : "";
+  if (e.active === "ollama") {
+    const model = (window.dashGetModel && window.dashGetModel()) || health.model;
+    return {kind: "ready", state: "ready", text: "Ollama · idle", short: "Idle", label: `Ollama ready · ${model}`, detail: lastText};
+  }
+  return {kind: "ready", state: "ready", text: `${who} · idle`, short: "Idle", label: `${name} ready`, detail: lastText};
 }
 // /api/stats older than 15 s (or the server says its poller failed): the numbers may not be current
 function statsStale() {
@@ -269,13 +340,53 @@ function statsStale() {
   return stats.ts != null && Date.now() / 1000 - stats.ts > 15;
 }
 function updatePill() {
-  const p = pcState(), stale = statsStale();
-  const text = p.text + (stale && p.state !== "error" ? " · stale" : "");
+  const p = pcState(), stale = statsStale() && p.state !== "error";
+  const text = p.text + (stale ? " · stale" : "");
   $("pill").dataset.state = p.state;
   $("pill-text").textContent = text;
+  $("pill-short").textContent = p.short + (stale ? " · stale" : "");
   const why = stale ? (stats && stats.error ? `Data may be out of date: ${stats.error}` : "Data may be out of date") : "";
   $("pill").title = why ? `${text} — ${why}` : text;
   $("pill").setAttribute("aria-label", $("pill").title);
+  renderStatus(p);
+  paintEmpty(p);
+}
+// the Monitor's status bar: the dot, the sentence, its detail, the action and (only for real progress) the bar
+function renderStatus(p) {
+  if (tab !== "monitor") return;
+  const card = $("state-card"), act = $("state-act"), prog = $("state-progress");
+  card.dataset.state = p.state;
+  $("state-label").textContent = p.label;
+  $("state-detail").innerHTML = subHtml(p.detail);
+  act.hidden = !p.act;
+  if (p.act) { act.textContent = p.act.label; act.onclick = () => goTo(p.act.tab, p.act.card); }
+  prog.hidden = p.pct == null;
+  if (p.kind === "reading") prog.dataset.tone = "info"; else delete prog.dataset.tone;
+  $("state-bar").style.width = `${p.pct || 0}%`;
+}
+// open a tab and bring one of its cards into view (the status bar's and the chat's actions)
+function goTo(name, card) {
+  showTab(name);
+  const el = card && $(card);
+  if (el && !el.hidden) { el.scrollIntoView({block: "start"}); el.focus({preventScroll: true}); }
+}
+// The chat's empty state says what will happen to a question now, not just which model is installed.
+// Builder writes its own line (builder.js).
+function paintEmpty(p = pcState()) {
+  const sub = $("chat-empty-sub"), target = window.dashGetTarget ? window.dashGetTarget() : "model";
+  if (!sub || target === "builder") return;
+  const e = (stats && stats.engine) || {};
+  const model = e.active === "strata" ? engineName(e) : (window.dashGetModel && window.dashGetModel()) || health.model;
+  const text = target === "agent" ? "Hermes answers with its tools and memory — it can run commands on the PC."
+    : {asleep: "__PC_NAME__ is asleep — wake it under Manage.",
+       video: "The GPU is making a video — chat answers when it's done.",
+       "video-idle": "The video engine still holds the GPU — chat answers once it gives it back, or take it back under Manage.",
+       loading: `Loading ${engineName(e)} — chat answers when it's ready.`,
+       none: "No model engine runs — pick one under Manage.",
+       offline: "The dashboard server does not answer right now.",
+       error: `${engineName(e)} is not answering — restart it under Manage.`}[p.kind]
+    || `${model} runs on this PC. Nothing leaves it.`;
+  if (sub.textContent !== text) sub.textContent = text;
 }
 
 function render(m) {
@@ -333,43 +444,17 @@ function renderTotals(t) {
 }
 let reqKey = "";          // the request table is rebuilt only when its rows change
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, has) {
-  // model state (asleep, a video, loading or no data light no badge: none of them is the model's own state)
-  const pc = pcState(), prog = $("state-progress");
-  const on = pc.label ? (pc.state === "error" ? "error" : "") : live.queued > 0 ? "queued" : live.state;
-  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", !!on && (b.dataset.s === on || (!pc.label && b.dataset.s === live.state)));
-  let label = "Waiting for a request", detail = "", pct = 0;
-  if (pc.label) {                                  // asleep, making a video, loading, no data
-    label = pc.label;
-    delete prog.dataset.tone;
-    if (pc.state === "error") detail = metricsErr ? metricsErr.message : "";
-  } else if (live.state === "reading") {
-    label = "Reading prompt";
-    prog.dataset.tone = "info";
-    if (live.prompt_total) {
-      pct = (100 * live.prompt_read) / live.prompt_total;
-      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
-    } else if (live.prompt_tokens != null) {
-      detail = `${fmt(live.prompt_tokens)} tokens`;
-    }
-  } else if (live.state === "generating") {
-    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
-    delete prog.dataset.tone;
-    pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = [live.generated != null ? `${fmt(live.generated)} tokens` : "", live.tok_s != null ? `${fmt(live.tok_s, 1)} tok/s` : ""]
-      .filter(Boolean).join(" · ");
-  } else if (last) {
-    delete prog.dataset.tone;
-    const parts = [last.output_tokens != null ? `${fmt(last.output_tokens)} tokens` : "",
-                   last.decode_tok_s ? `${fmt(last.decode_tok_s, 1)} tok/s` : ""].filter(Boolean);
-    detail = parts.length ? `last: ${parts.join(" at ")}` : "";
-  }
-  $("state-label").textContent = label;
-  $("state-detail").textContent = detail;
-  $("state-bar").style.width = `${pct}%`;
+  // the time the graphs cover: the server keeps up to 120 samples, one per poll (/api/stats poll_s)
+  const samples = Math.max(0, ...Object.values(h).map((x) => (Array.isArray(x) ? x.length : 0)));
+  const secs = (samples - 1) * ((stats && stats.poll_s) || 2);
+  const spanText = has && samples > 1 ? `graphs: last ${secs < 90 ? `${fmt(secs)} s` : `${fmt(secs / 60)} min`}` : "";
+  for (const el of document.querySelectorAll(".spark-span")) el.textContent = spanText;
 
-  // the eight cards
+  // the eight cards. Speed: no engine that writes text (asleep, H3, none) = one dash and why, not two lone dashes
+  const e = stats && stats.engine, noModel = !!stats && (stats.online === false || !llmRunning(e));
+  $("card-speed").classList.toggle("speed-off", noModel);
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
-  setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
+  setMetric("speed", speed == null || noModel ? null : fmt(speed, 1), "t/s", noModel ? "no model running" :
             live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
   const prefill = live.state === "reading" || live.state === "generating" ? live.prefill_tok_s_mean
                 : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
@@ -392,7 +477,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, has) 
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
             multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`))
                   : hw.gpu_mem_temp != null ? `VRAM ${fmt(hw.gpu_mem_temp)} °C` : "");
-  spark("sp-temp", h.gpu_temp, crit, 30);
+  spark("sp-temp", h.gpu_temp, crit, 30, TEMP_BANDS.gpu);
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
@@ -417,8 +502,13 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, has) 
   }
   spark("sp-disk", h.disk_read_mb);
 
-  // context fill: the running request, else the last one; no model or no context size = no gauge
-  const ctx = eng.max_context || 0;
+  // context fill: the running request, else the last one; no model or no context size = no gauge. The experts
+  // are Strata's alone. Without either, the card's other two bars repeat the RAM and GPU temp cards: it goes.
+  const ctx = noModel ? 0 : eng.max_context || 0;
+  $("ctx-gauge").hidden = !ctx;
+  $("ctx-experts").hidden = !eng.expert_slots;
+  document.querySelector(".ctx-card").classList.toggle("no-data", !ctx && !eng.expert_slots);
+  document.querySelector(".monitor-row").classList.toggle("dash-single-auto", !ctx && !eng.expert_slots);
   let used = null;
   if (live.state === "reading" || live.state === "generating") used = (live.prompt_tokens || 0) + (live.generated || 0);
   else if (last && last.prompt_tokens != null) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
@@ -447,6 +537,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, has) 
   if (key !== reqKey) {
     reqKey = key;
     const body = $("req-body");
+    // nothing to list: one line instead of an empty table
+    $("req-none").hidden = !!requests.length;
+    $("req-none").textContent = has ? "No requests yet" : "–";
+    $("req-wrap").hidden = !requests.length;
     if (!requests.length) {
       body.innerHTML = `<tr><td colspan="8" class="muted">${has ? "No requests yet" : "–"}</td></tr>`;
     } else {
@@ -488,13 +582,17 @@ function projectionText(c) {
 }
 let aboutKey = "";        // About is rebuilt only when what it shows changes (or the tab opens)
 function renderAbout(eng, hw, st) {
-  const key = JSON.stringify([eng, hw.gpu_mem_total, hw.ram_total, st]);
+  // with H3 or no engine on the GPU, /metrics still names Ollama's default model: say nothing is loaded instead
+  const e = stats && stats.engine, on = !stats || llmRunning(e);
+  if (!on) eng = {};
+  const key = JSON.stringify([eng, on, e && e.active, hw.gpu_mem_total, hw.ram_total, st]);
   if (key === aboutKey) return;
   aboutKey = key;
   const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
   facts($("facts-engine"), [
-    ["Model", eng.model],
-    ["Engine", eng.version ? `v${eng.version}` : "built from source"],
+    ["Model", on ? (e && e.active === "strata" ? `${engineName(e)} (${eng.model || e.model})` : eng.model)
+              : e && e.active === "h3" ? "nothing loaded — the video engine holds the GPU" : "nothing loaded"],
+    ["Engine", on && e ? (e.active === "strata" ? "Strata" : "Ollama") + (eng.version ? ` v${eng.version}` : "") : eng.version ? `v${eng.version}` : null],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
@@ -511,7 +609,7 @@ function renderAbout(eng, hw, st) {
   facts($("facts-api"), [
     ["OpenAI base URL", `${base}/v1`, true],
     ["Anthropic base URL", base, true],
-    ["Model name", eng.model, true],
+    ["Model name", on ? eng.model : null, true],
   ]);
 }
 document.addEventListener("click", (e) => {
@@ -939,7 +1037,7 @@ async function send() {
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
       try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-      if (r.status === 401) msg = "This server needs an API key: add it under About > Settings.";
+      if (r.status === 401) msg = "This server needs an API key: add it under Manage > Settings.";
       throw new Error(msg);
     }
     const reader = r.body.getReader(), dec = new TextDecoder();
@@ -1216,15 +1314,21 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawe
 // manage.js (loaded first, runs on DOMContentLoaded) formats with these and hands over each /api/stats answer.
 window.dash = {
   fmt, kfmt, gb, esc, icon, subHtml, spark, timeout,
+  paintEmpty, goTo, TEMP_BANDS,
   setStats(s) {
     stats = s; statsAt = s ? Date.now() : statsAt;
     updatePill();
-    if (tab === "monitor" && !lastMetrics) render(null);     // the Model state card follows the pill
+    if (tab === "monitor" && !lastMetrics) render(null);     // the status bar follows the pill
+    // H3 renders but the Studio has no running job yet (started elsewhere, e.g. by Hermes): let it look
+    const e = s && s.engine;
+    if (e && e.active === "h3" && e.state === "rendering" && !videoJob()) window.dispatchEvent(new CustomEvent("dash:video-poll"));
   },
   stats: () => stats,
   metrics: () => lastMetrics,
 };
 // the engine or its model changed (manage.js sees it first): the chat's model name, pictures and context follow
+// the Studio's job list changed: the pill and the status bar show the render's progress
+window.addEventListener("dash:video", () => updatePill());
 window.addEventListener("dash:engine", () => {
   loadHealth();
   if (tab === "about") { aboutKey = ""; loadConfig(); }

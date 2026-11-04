@@ -181,7 +181,9 @@
     if (!want) return "";
     const entry = list.find((c) => c.id === current);
     if (!entry) return want;                                    // a new chat: name it well from the start
-    return entry.title === serverTitle(msgs) && entry.title !== want ? want : "";
+    // only a weak title ("hey", "oins.") is replaced; a good long first question keeps its fuller title
+    const weak = clean(entry.title).split(" ").length < 3 || clean(entry.title).length < 12;
+    return weak && entry.title === serverTitle(msgs) && entry.title !== want ? want : "";
   }
   async function sync() {
     if (offline || !messages.length) return;

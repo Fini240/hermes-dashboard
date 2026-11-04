@@ -80,14 +80,30 @@ main { flex: 1; min-height: 0; display: flex; }
 .view--monitor, .view--about { overflow-y: auto; }
 .monitor, .about { max-width: 1240px; width: 100%; margin: 0 auto; padding: var(--st-s-6); display: flex; flex-direction: column;
                    gap: var(--st-s-5); }
-.state-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
-.state-card__head { display: flex; align-items: center; gap: var(--st-s-4); flex-wrap: wrap; }
-.badges { display: flex; gap: var(--st-s-2); flex-wrap: wrap; }
-.badges .st-badge { opacity: .38; transition: opacity var(--st-dur); }
-.badges .st-badge.on { opacity: 1; }
-.state-card__row { display: flex; justify-content: space-between; gap: var(--st-s-4); font-size: var(--st-fs-sm);
-                   font-weight: var(--st-fw-medium); font-variant-numeric: tabular-nums; }
+/* the status bar: a dot coloured by the state, one sentence, its detail, the action that fits */
+.state-card { display: flex; flex-direction: column; gap: var(--st-s-3); padding: var(--st-s-3) var(--st-s-5); }
+.state-card__row { display: flex; align-items: center; gap: var(--st-s-2) var(--st-s-3); flex-wrap: wrap; min-height: 42px;
+                   font-variant-numeric: tabular-nums; }
+.state-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--st-ink-muted); flex: none; }
+.state-text { font-weight: var(--st-fw-bold); font-size: var(--st-fs-base); color: var(--st-ink); }
+.state-detail { flex: 1; min-width: 0; font-size: var(--st-fs-sm); }
+.state-act { height: 36px; padding: 0 14px; margin-left: auto; }
+.state-card[data-state="ready"] .state-dot, .state-card[data-state="generating"] .state-dot { background: var(--st-accent); }
+.state-card[data-state="reading"] .state-dot { background: var(--st-info); }
+.state-card[data-state="busy"] .state-dot, .state-card[data-state="queued"] .state-dot { background: var(--st-warn); }
+.state-card[data-state="error"] .state-dot { background: var(--st-danger); }
+.state-card[data-state="off"] .state-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--st-ink-muted); }
+/* metric cards under two small headings (GPU, System); the graphs' time span sits beside each */
+.metric-groups { display: flex; flex-direction: column; gap: var(--st-s-5); }
+.metric-group { display: flex; flex-direction: column; gap: var(--st-s-2); }
+.metric-group__head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--st-s-3); padding: 0 var(--st-s-1); }
+.metric-group__title { margin: 0; font-size: var(--st-fs-sm); font-weight: var(--st-fw-bold); color: var(--st-ink-soft);
+                       letter-spacing: .04em; text-transform: uppercase; }
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--st-s-4); }
+.metric-card.speed-off .speed-prefill { display: none; }
+.ctx-card.no-data { display: none; }
+.monitor-row.dash-single-auto { grid-template-columns: 1fr; }
+.req-none { margin: 0; font-size: var(--st-fs-md); }
 .metric-card { padding: var(--st-s-4) var(--st-s-5); }
 .st-metric__value small { font-size: var(--st-fs-md); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin-left: 4px; }
 .st-metric__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; min-height: 1em; }
@@ -138,6 +154,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .about { max-width: 860px; }
 .about .st-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
 .about p { margin: 0; }
+#pill-short { display: none; }
 .facts { display: grid; grid-template-columns: minmax(140px, max-content) 1fr; gap: 10px var(--st-s-6); margin: 0; font-size: var(--st-fs-md); }
 .facts dt { color: var(--st-ink-muted); }
 .facts dd { margin: 0; color: var(--st-ink-soft); font-variant-numeric: tabular-nums; display: flex; align-items: center; gap: 6px;
@@ -176,6 +193,7 @@ main { flex: 1; min-height: 0; display: flex; }
   .st-tab { padding: 0 10px; }
   .st-tab .st-icon { display: none; }
   #pill-text { display: none; }
+  #pill-short { display: inline; }
   .chat { padding: var(--st-s-5) var(--st-s-4); }
   .composer-wrap { padding: 0 var(--st-s-3) var(--st-s-3); }
   .monitor, .about { padding: var(--st-s-4); }
