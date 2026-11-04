@@ -158,15 +158,42 @@
     clearTimeout(syncTimer);
     syncTimer = setTimeout(sync, 600);
   };
+  // A chat's title. The server takes the first question as it is, and a voice chat's first "question" is often a
+  // greeting or a misheard fragment ("oins.", "Fine."). The title comes from the first question with a few words
+  // instead, cut at a word boundary near 40 characters.
+  const clean = (t) => String(t || "").replace(/\s+/g, " ").trim();
+  const userTexts = (msgs) => msgs.filter((m) => m.role === "user" && clean(m.text)).map((m) => clean(m.text));
+  function autoTitle(msgs) {
+    const texts = userTexts(msgs);
+    const t = texts.find((x) => x.split(" ").length >= 3 && x.length >= 12) || "";
+    if (!t) return "";
+    if (t.length <= 40) return t;
+    const cut = t.slice(0, 41), sp = cut.lastIndexOf(" ");
+    return (sp > 20 ? cut.slice(0, sp) : cut.slice(0, 40)).replace(/[\s,.;:–-]+$/, "") + "…";
+  }
+  // the title the server made on its own (chat_put): renamed titles never look like this, so only these are improved
+  function serverTitle(msgs) {
+    const first = userTexts(msgs)[0] || "";
+    return first.slice(0, 60) + (first.length > 60 ? "…" : "");
+  }
+  function betterTitle(msgs) {
+    const want = autoTitle(msgs);
+    if (!want) return "";
+    const entry = list.find((c) => c.id === current);
+    if (!entry) return want;                                    // a new chat: name it well from the start
+    return entry.title === serverTitle(msgs) && entry.title !== want ? want : "";
+  }
   async function sync() {
     if (offline || !messages.length) return;
     if (!current) { current = newId(); ls.set("dash.chat-id", current); }
     const strip = messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
                                          files: (m.files || []).map((f) => ({name: f.name}))}));
     try {
-      await api("PUT", `/api/chats/${encodeURIComponent(current)}`,
-                {messages: strip, target: ls.get("dash.chat-target", "model"), model: window.dashGetModel ? window.dashGetModel() : "",
-                 builder: window.dashBuilder ? window.dashBuilder.get() : null});
+      const body = {messages: strip, target: ls.get("dash.chat-target", "model"), model: window.dashGetModel ? window.dashGetModel() : "",
+                    builder: window.dashBuilder ? window.dashBuilder.get() : null};
+      const title = betterTitle(messages);
+      if (title) body.title = title;
+      await api("PUT", `/api/chats/${encodeURIComponent(current)}`, body);
       await refresh();
     } catch (e) { /* offline: the browser copy still has it */ }
   }

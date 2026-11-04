@@ -14,13 +14,19 @@ Stdlib only — no pip install.
 
 import argparse
 import base64
+import concurrent.futures
+import ipaddress
 import json
+import math
 import os
+import shlex
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,8 +52,12 @@ STATE_DB = os.path.expanduser(os.environ.get("HERMES_STATE_DB", "~/.hermes/state
 STRATA_URL = os.environ.get("HERMES_STRATA_URL", "").rstrip("/")
 STRATA_KEY = os.environ.get("HERMES_STRATA_KEY", "")
 POLL_SECONDS = 2.0
-# Seconds of history the tok/s average is computed over.
-RATE_WINDOW = 25.0
+# Nobody has looked at the page for IDLE_AFTER seconds: probe the PC only every
+# IDLE_POLL_SECONDS. Each probe is an ssh round trip plus a ~3 KB command that
+# tailscaled logs into the PC's journal, so an unwatched dashboard should not
+# keep doing it every 2 s. A page request wakes the poller at once.
+IDLE_AFTER = 60.0
+IDLE_POLL_SECONDS = 20.0
 # Everything RAPL and the GPU sensor cannot see: chipset, RAM, NVMe, fans,
 # USB. A rough constant, so the wall figure is labelled an estimate.
 SYSTEM_OVERHEAD_W = 55.0
@@ -75,6 +85,9 @@ SSH_OPTS = [
     "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
     "-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/.hermes-dash-%r@%h",
     "-o", "ControlPersist=120s", "-o", "StrictHostKeyChecking=accept-new",
+    # A PC that went to sleep under an open master connection otherwise leaves
+    # ssh waiting on a dead TCP session; this drops it after ~10 s.
+    "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
 ]
 
 # On the Mac the agent supplies the key. In a container there is no agent, so
@@ -91,32 +104,61 @@ if _SSH_KEY:
 PROBE = r"""
 for c in /sys/class/drm/card*/device; do
   [ -f "$c/gpu_busy_percent" ] || continue
-  echo "gpu_busy=$(cat $c/gpu_busy_percent 2>/dev/null)"
+  # gpu_busy_percent is an instant reading that jumps between 0 and 100 while a
+  # model runs; five reads 0.1 s apart give a figure that means something.
+  _b=0; _n=0
+  for _i in 1 2 3 4 5; do
+    _v=$(cat "$c/gpu_busy_percent" 2>/dev/null) && [ -n "$_v" ] && { _b=$((_b+_v)); _n=$((_n+1)); }
+    [ $_i -lt 5 ] && sleep 0.1
+  done
+  [ $_n -gt 0 ] && echo "gpu_busy=$(awk -v b=$_b -v n=$_n 'BEGIN{printf "%.1f", b/n}')"
   echo "vram_used=$(cat $c/mem_info_vram_used 2>/dev/null)"
   echo "vram_total=$(cat $c/mem_info_vram_total 2>/dev/null)"
   for h in $c/hwmon/hwmon*/; do
-    # Hottest sensor, not temp1 (edge): edge reads ~55 °C while junction is at 93.
-    echo "gpu_temp=$(cat ${h}temp*_input 2>/dev/null | sort -n | tail -1)"
-    echo "gpu_power=$(cat ${h}power1_average 2>/dev/null)"
+    # Every temperature by its label (amdgpu: edge, junction, mem). The dashboard
+    # shows junction: edge reads ~55 °C while junction is at 93.
+    for t in ${h}temp*_input; do
+      [ -r "$t" ] || continue
+      l=$(cat "${t%_input}_label" 2>/dev/null | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9_')
+      [ -n "$l" ] || { l=${t##*/}; l=${l%_input}; }
+      echo "gpu_temp_$l=$(cat "$t" 2>/dev/null)"
+      [ -r "${t%_input}_crit" ] && echo "gpu_temp_${l}_crit=$(cat "${t%_input}_crit" 2>/dev/null)"
+    done
+    # power1_average is gone on newer kernels for some cards; power1_input replaces it.
+    echo "gpu_power=$(cat ${h}power1_average 2>/dev/null || cat ${h}power1_input 2>/dev/null)"
     echo "gpu_power_cap=$(cat ${h}power1_cap 2>/dev/null)"
     echo "gpu_fan=$(cat ${h}fan1_input 2>/dev/null)"
+    echo "gpu_fan_max=$(cat ${h}fan1_max 2>/dev/null)"
   done
+  # PCIe link. Navi cards sit behind their own internal switch whose ports always
+  # report full speed, so walk up every bridge to the root port and keep the
+  # slowest link: that is the real slot link (here 8 GT/s x16 at 0000:09:00.0).
+  _x=$(readlink -f "$c")
+  while [ -r "$_x/current_link_speed" ]; do
+    echo "$(cut -d' ' -f1 "$_x/current_link_speed" 2>/dev/null) $(cat "$_x/current_link_width" 2>/dev/null) $(cut -d' ' -f1 "$_x/max_link_speed" 2>/dev/null) $(cat "$_x/max_link_width" 2>/dev/null)"
+    _x=${_x%/*}
+  done | awk '$1+0>0 && $2+0>0 {
+      if(!n||$1+0<s)s=$1+0; if(!n||$2+0<w)w=$2+0
+      if($3+0>0&&(!ms||$3+0<ms))ms=$3+0; if($4+0>0&&(!mw||$4+0<mw))mw=$4+0; n++ }
+    END{ if(n){ print "pcie_speed="s; print "pcie_width="w; print "pcie_max_speed="ms; print "pcie_max_width="mw } }'
   break
 done
 awk '/MemTotal/{print "mem_total="$2} /MemAvailable/{print "mem_avail="$2}' /proc/meminfo
+# RAPL is cumulative microjoules; the timestamp read right beside it makes the
+# watts figure independent of how long ssh took to deliver the answer.
 echo "cpu_energy=$(cat /sys/class/powercap/intel-rapl:0/energy_uj 2>/dev/null)"
+echo "now_ns=$(date +%s%N)"
 echo "cpu_energy_max=$(cat /sys/class/powercap/intel-rapl:0/max_energy_range_uj 2>/dev/null)"
 for h in /sys/class/hwmon/hwmon*/; do
   # Hottest of Tctl and the per-CCD dies, not just temp1.
   [ "$(cat $h/name 2>/dev/null)" = "k10temp" ] && echo "cpu_temp=$(cat ${h}temp*_input 2>/dev/null | sort -n | tail -1)" && break
 done
-echo "cpu_freq=$(awk '{s+=$1;n++} END{if(n)printf "%d", s/n}' /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null)"
+awk '{s+=$1; if($1>m)m=$1; n++} END{if(n){printf "cpu_freq=%d\ncpu_freq_max=%d\n", s/n, m}}' /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null
 echo "cpu_stat=$(head -1 /proc/stat)"
 echo "cpu_model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')"
 echo "ncpu=$(nproc)"
 echo "load=$(cut -d' ' -f1 /proc/loadavg)"
 echo "uptime=$(cut -d. -f1 /proc/uptime)"
-echo "top=$(ps -eo pcpu,comm --sort=-pcpu --no-headers 2>/dev/null | head -3 | awk '{printf "%s %s|", $1, $2}')"
 # Are the monitors lit? Every connected DRM connector carries its own DPMS
 # state, and the compositor's blanking lands here, so this reads the truth
 # whoever turned them off — the dashboard, the screen locker, or a key press
@@ -141,21 +183,39 @@ echo "mon_off=$_mon_off"
 echo "rgb=$(cat /var/lib/hermes-rgb/state 2>/dev/null)"
 [ -x /usr/local/bin/rgb-apply ] && echo "rgb_avail=1" || echo "rgb_avail=0"
 echo "rgb_auto=$(systemctl is-active rgb-auto 2>/dev/null)"
-# Which engine holds the GPU, Ollama or Strata (and Strata's live state).
+# Which engine holds the GPU, Ollama, Strata or H3 (and Strata's live state).
 # llm-engine lives on the PC (pc-setup/), so service names, Strata's address
 # and its API key stay there; absent, the engine card simply does not render.
-[ -x /usr/local/bin/llm-engine ] && /usr/local/bin/llm-engine probe 2>/dev/null
+_eng=
+[ -x /usr/local/bin/llm-engine ] && _eng=$(/usr/local/bin/llm-engine probe 2>/dev/null)
+[ -n "$_eng" ] && printf '%s\n' "$_eng"
 # True generation speed straight from Ollama's own llama-server timings, which
-# it logs to the system journal (identifier "ollama"). This is the real tok/s of
-# the last completed response for ANY client, not just Hermes traffic, and it
-# lands in the journal within a moment of the response finishing. The grep runs
-# here on the box (only the final line crosses SSH), so -n can be generous — it
-# has to reach back past llama-server's very verbose per-request logging to the
-# last generation line. (journalctl --grep reorders results under -n on some
-# versions, so we filter chronological output client-side instead.)
-_g=$(journalctl -t ollama -o short-unix --no-pager -n 3000 2>/dev/null | grep 'eval time =' | grep -v 'prompt eval time' | tail -1)
-echo "gen_rate=$(printf '%s' "$_g" | sed -n 's/.*, *\([0-9.]*\) tokens per second.*/\1/p')"
-echo "gen_ts=$(printf '%s' "$_g" | awk '{print $1}' | cut -d. -f1)"
+# it logs to the system journal (identifier "ollama"): the real tok/s of the
+# last completed response for ANY client. Only read while Ollama has the GPU
+# (or on a box without llm-engine, where Ollama is all there is), and only the
+# last two hours, so the scan stays cheap. awk keeps the last "eval time" line
+# and the "prompt eval time" line that came just before it (same request), and
+# only key=value lines cross SSH. (journalctl --grep reorders results under -n
+# on some versions, so the filtering happens here instead.)
+case "$_eng" in
+  ""|*engine_ollama=active*|*engine_ollama=activating*)
+    journalctl -t ollama -o short-unix --no-pager --since "-2h" -n 3000 2>/dev/null | awk '
+      /prompt eval time =/ { p = $0; next }
+      / eval time =/ { g = $0; gp = p }
+      function two(line, re, pre,   s, b) {
+        if (!match(line, re)) return
+        s = substr(line, RSTART, RLENGTH); gsub(/[^0-9. ]/, " ", s); split(s, b, " ")
+        print pre "_ms=" b[1]; print pre "_tokens=" b[2]
+      }
+      END {
+        if (g == "") exit
+        ts = g; sub(/[ .].*/, "", ts); print "gen_ts=" ts
+        if (match(g, /[0-9.]+ tokens per second/)) { r = substr(g, RSTART, RLENGTH); sub(/ .*/, "", r); print "gen_rate=" r }
+        two(g, "eval time = *[0-9.]+ ms / *[0-9]+ tokens", "gen")
+        if (gp != "") two(gp, "eval time = *[0-9.]+ ms / *[0-9]+ tokens", "prompt")
+      }'
+    ;;
+esac
 """
 
 # The same box may be booted into Windows. Windows needs a completely different
@@ -169,14 +229,20 @@ WIN_USER = os.environ.get("HERMES_WIN_SSH_USER", "user")
 
 PROBE_WIN = r"""
 $ErrorActionPreference='SilentlyContinue'; $ProgressPreference='SilentlyContinue'
+# One Get-Counter call for all four counters: every call samples for about a
+# second, so separate calls would add up. The samples are told apart by path.
+$cs = (Get-Counter -Counter @('\GPU Engine(*)\Utilization Percentage',
+                              '\GPU Process Memory(*)\Dedicated Usage',
+                              '\Memory\Available KBytes',
+                              '\Processor Information(_Total)\% Processor Performance') -EA 0).CounterSamples
 # Count only render/compute engines. Summing every engine double-counts and a
 # video-decode engine alone was reading 52% while the GPU was otherwise idle.
-$gs = (Get-Counter '\GPU Engine(*)\Utilization Percentage' -EA 0).CounterSamples |
-      Where-Object { $_.InstanceName -match 'engtype_(3D|Compute)' }
-$busy = 0; if($gs){ $busy = [math]::Min(100,[math]::Round(($gs | Measure-Object CookedValue -Sum).Sum,0)) }
-"gpu_busy=$busy"
-$vm = (Get-Counter '\GPU Process Memory(*)\Dedicated Usage' -EA 0).CounterSamples
+$gs = $cs | Where-Object { $_.Path -match '\\gpu engine\(' -and $_.InstanceName -match 'engtype_(3D|Compute)' }
+if($gs){ "gpu_busy=$([math]::Min(100,[math]::Round(($gs | Measure-Object CookedValue -Sum).Sum,0)))" }
+$vm = $cs | Where-Object { $_.Path -match '\\gpu process memory\(' }
 if($vm){ "vram_used=$([int64](($vm | Measure-Object CookedValue -Sum).Sum))" }
+$ma = $cs | Where-Object { $_.Path -match '\\memory\\available kbytes$' } | Select-Object -First 1
+$pf = $cs | Where-Object { $_.Path -match '\\% processor performance$' } | Select-Object -First 1
 $vt = 0
 Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}' -EA 0 |
   ForEach-Object { $q = (Get-ItemProperty $_.PSPath -EA 0).'HardwareInformation.qwMemorySize'
@@ -184,28 +250,33 @@ Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-
 if($vt){ "vram_total=$vt" }
 $os = Get-CimInstance Win32_OperatingSystem
 "mem_total=$($os.TotalVisibleMemorySize)"
-"mem_avail=$($os.FreePhysicalMemory)"
+# Available KBytes counts the standby cache as free, like Linux MemAvailable;
+# FreePhysicalMemory does not, and made Windows look nearly full.
+if($ma){ "mem_avail=$([int64]$ma.CookedValue)" } else { "mem_avail=$($os.FreePhysicalMemory)" }
 # Cumulative 100ns counters -> /proc/stat jiffies, so the existing delta maths works.
 $c = Get-CimInstance Win32_PerfRawData_PerfOS_Processor -Filter "Name='_Total'"
 if($c){ "cpu_stat=cpu $([int64]($c.PercentUserTime/100000)) 0 $([int64]($c.PercentPrivilegedTime/100000)) $([int64]($c.PercentIdleTime/100000)) 0 0 0" }
 $p = Get-CimInstance Win32_Processor | Select-Object -First 1
 "cpu_model=$($p.Name)"
 "ncpu=$($p.NumberOfLogicalProcessors)"
-"cpu_freq=$([int]$p.CurrentClockSpeed * 1000)"
+# CurrentClockSpeed is a static value on most boards; % Processor Performance
+# is the live share of the base clock (above 100 while boosting).
+if($pf -and $p.MaxClockSpeed){ "cpu_freq=$([int64]($p.MaxClockSpeed * $pf.CookedValue / 100 * 1000))" }
 "uptime=$([int]((Get-Date) - $os.LastBootUpTime).TotalSeconds)"
-$q = (Get-Counter '\System\Processor Queue Length' -EA 0).CounterSamples.CookedValue
-"load=$([math]::Round($(if($q){$q}else{0}),2))"
-"top=$((Get-Process | Sort-Object CPU -Descending | Select-Object -First 3 | ForEach-Object { '{0:N1} {1}|' -f $_.CPU,$_.ProcessName }) -join '')"
+# No load: Windows has no load average (queue length is not one), so the UI shows "-".
 # Ollama's own llama-server timings, same figure the Linux side reads from journald.
+# gen_ts is when the log was last written, i.e. when that response finished.
 $best=$null
 Get-ChildItem "$env:LOCALAPPDATA\Ollama\server*.log" -EA 0 | Sort-Object LastWriteTime -Descending | ForEach-Object {
   if(-not $best){
-    $l = Get-Content $_.FullName -Tail 3000 -EA 0 |
+    $f = $_
+    $l = Get-Content $f.FullName -Tail 3000 -EA 0 |
          Where-Object { $_ -match 'eval time =' -and $_ -notmatch 'prompt eval time' } | Select-Object -Last 1
     if($l -and $l -match '([0-9.]+) tokens per second'){
       $best = $matches[1]
       "gen_rate=$best"
-      "gen_ts=$([int](Get-Date -UFormat %s))"
+      "gen_ts=$(([DateTimeOffset]$f.LastWriteTimeUtc).ToUnixTimeSeconds())"
+      if($l -match 'eval time =\s*([0-9.]+) ms /\s*([0-9]+) tokens'){ "gen_ms=$($matches[1])"; "gen_tokens=$($matches[2])" }
     }
   }
 }
@@ -222,6 +293,28 @@ def _win_cmd(ps):
     """
     return "powershell -NoProfile -EncodedCommand " + base64.b64encode(
         ps.encode("utf-16-le")).decode()
+
+def _last_line(text, default="command failed"):
+    """The last non-empty line of ssh's output (where the real error is), capped."""
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    return (lines[-1].strip() if lines else default)[:160]
+
+
+def _ssh_action(target, remote, marker, done, timeout):
+    """Run one remote command for a button. Returns (ok, message).
+
+    ok needs both exit status 0 and the marker word on stdout: several remote
+    commands background their real work, so a bare exit 0 proves too little.
+    """
+    try:
+        r = subprocess.run(["ssh", *SSH_OPTS, target, remote],
+                           capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, str(e)[:160]
+    if r.returncode == 0 and marker in r.stdout:
+        return True, done
+    return False, _last_line(r.stderr or r.stdout)
+
 
 def _magic(mac):
     return b"\xff" * 6 + bytes.fromhex(mac.replace(":", "").replace("-", "")) * 16
@@ -273,6 +366,8 @@ def wake_via_relay_dashboard():
 
 def wake_relay():
     """Have a tailnet host that sits on the PC's LAN emit the packet."""
+    if not RELAY_HOST:
+        return False, "no relay ssh host configured (HERMES_RELAY_SSH_HOST)"
     snippet = (
         "import socket;"
         "p=b'\\xff'*6+bytes.fromhex('%s')*16;"
@@ -281,16 +376,8 @@ def wake_relay():
         "s.sendto(p,('%s',9));s.sendto(p,('255.255.255.255',9));"
         "print('sent')"
     ) % (MAC.replace(":", ""), LAN_BCAST)
-    try:
-        r = subprocess.run(
-            ["ssh", *SSH_OPTS, RELAY_HOST, 'python3 -c "%s"' % snippet],
-            capture_output=True, text=True, timeout=15,
-        )
-        if r.returncode == 0 and "sent" in r.stdout:
-            return True, "relayed via %s" % RELAY_HOST
-        return False, (r.stderr or r.stdout or "relay failed").strip().splitlines()[-1][:160]
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return False, str(e)[:160]
+    return _ssh_action(RELAY_HOST, 'python3 -c "%s"' % snippet, "sent",
+                       "relayed via %s" % RELAY_HOST, 15)
 
 
 def wake():
@@ -361,17 +448,10 @@ def display_action(action):
         # user, so say so rather than failing cryptically.
         return False, ("monitor control is Linux-only — an ssh session on Windows "
                        "cannot reach the desktop that owns the displays")
-    remote = DISPLAY_SH.replace("__ACT__", action)
-    try:
-        r = subprocess.run(["ssh", *SSH_OPTS, "root@" + HOST, remote],
-                           capture_output=True, text=True, timeout=20)
-        if r.returncode == 0 and "queued" in r.stdout:
-            return True, ("monitors off — the PC stays awake and online; a key press "
-                          "or mouse move at the PC brings them back"
-                          if action == "off" else "monitors on")
-        return False, (r.stderr or r.stdout or "command failed").strip().splitlines()[-1][:160]
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return False, str(e)[:160]
+    return _ssh_action("root@" + HOST, DISPLAY_SH.replace("__ACT__", action), "queued",
+                       ("monitors off — the PC stays awake and online; a key press "
+                        "or mouse move at the PC brings them back"
+                        if action == "off" else "monitors on"), 20)
 
 
 RGB_COLORS = ("red", "purple", "blue", "green", "off")
@@ -390,20 +470,13 @@ def rgb_action(color):
         return False, "unknown colour"
     if pc_os() == "windows":
         return False, "RGB control is Linux-only — OpenRGB is set up on the Linux side"
-    try:
-        # Picking a colour by hand ends the automatic mode. Leaving both on
-        # would mean the daemon silently reverting the choice at the next load
-        # transition, which reads as the button not working.
-        r = subprocess.run(["ssh", *SSH_OPTS, "root@" + HOST,
-                            "systemctl disable --now rgb-auto >/dev/null 2>&1; "
-                            "/usr/local/bin/rgb-apply " + color],
-                           capture_output=True, text=True, timeout=30)
-        if r.returncode == 0 and "ok" in r.stdout:
-            return True, ("lights off" if color == "off" else "lights set to " + color)
-        err = (r.stderr or r.stdout or "command failed").strip().splitlines()
-        return False, (err[-1] if err else "command failed")[:160]
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return False, str(e)[:160]
+    # Picking a colour by hand ends the automatic mode. Leaving both on would
+    # mean the daemon silently reverting the choice at the next load
+    # transition, which reads as the button not working.
+    return _ssh_action("root@" + HOST,
+                       "systemctl disable --now rgb-auto >/dev/null 2>&1; "
+                       "/usr/local/bin/rgb-apply " + color, "ok",
+                       "lights off" if color == "off" else "lights set to " + color, 30)
 
 
 def rgb_auto_action(on):
@@ -418,17 +491,10 @@ def rgb_auto_action(on):
         return False, "automatic lighting is Linux-only"
     cmd = ("systemctl enable --now rgb-auto" if on
            else "systemctl disable --now rgb-auto")
-    try:
-        r = subprocess.run(["ssh", *SSH_OPTS, "root@" + HOST, cmd + " && echo queued"],
-                           capture_output=True, text=True, timeout=30)
-        if r.returncode == 0 and "queued" in r.stdout:
-            return True, ("lighting now follows the load — red while working, "
-                          "green when idle" if on else
-                          "automatic lighting off — the colour stays where it is")
-        err = (r.stderr or r.stdout or "command failed").strip().splitlines()
-        return False, (err[-1] if err else "command failed")[:160]
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return False, str(e)[:160]
+    return _ssh_action("root@" + HOST, cmd + " && echo queued", "queued",
+                       ("lighting now follows the load — red while working, "
+                        "green when idle" if on else
+                        "automatic lighting off — the colour stays where it is"), 30)
 
 
 ENGINES = ("ollama", "strata")
@@ -457,17 +523,10 @@ def engine_action(engine, model=""):
         return False, "unknown Strata model"
     if pc_os() == "windows":
         return False, "the engine switch is Linux-only"
-    try:
-        r = subprocess.run(["ssh", *SSH_OPTS, "root@" + HOST,
-                            "/usr/local/bin/llm-engine " + engine + (" " + STRATA_MODELS[model]["variant"] if model else "")],
-                           capture_output=True, text=True, timeout=90)
-        if r.returncode == 0 and "ok" in r.stdout:
-            return True, ("Strata is loading — about 80 s until it answers"
-                          if engine == "strata" else "Ollama has the GPU again")
-        err = (r.stderr or r.stdout or "command failed").strip().splitlines()
-        return False, (err[-1] if err else "command failed")[:160]
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return False, str(e)[:160]
+    return _ssh_action("root@" + HOST,
+                       "/usr/local/bin/llm-engine " + engine + (" " + STRATA_MODELS[model]["variant"] if model else ""),
+                       "ok", ("Strata is loading — about 80 s until it answers"
+                              if engine == "strata" else "Ollama has the GPU again"), 90)
 
 
 def power_action(action):
@@ -503,25 +562,59 @@ def power_action(action):
         cmd = "systemctl suspend" if action == "suspend" else "systemctl poweroff"
         target = "root@" + HOST
         remote = "nohup sh -c 'sleep 1; %s' >/dev/null 2>&1 & echo queued" % cmd
-
-    try:
-        r = subprocess.run(["ssh", *SSH_OPTS, target, remote],
-                           capture_output=True, text=True, timeout=15)
-        if r.returncode == 0 and "queued" in r.stdout:
-            return True, done
-        return False, (r.stderr or r.stdout or "command failed").strip()[:160]
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return False, str(e)[:160]
+    return _ssh_action(target, remote, "queued", done, 15)
 
 
-_snapshot = {"ok": False, "error": "starting up"}
+_snapshot = {"ok": False, "stale": True, "error": "starting up"}
 # Sparkline history for the page's Monitor while Strata is not the one answering
-# (Strata keeps its own). Same series names as Strata's /metrics "history".
+# (Strata keeps its own). Same series names as Strata's /metrics "history", plus
+# the dashboard's own cards. While the PC is unreachable every series gets None,
+# so a sleep shows as a gap rather than being squeezed out of the line.
 _HIST_KEYS = ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "cpu", "tok_s", "disk_read_mb",
-              "gpu_pcie_rx_mb", "prefill_tok_s_mean")
+              "gpu_pcie_rx_mb", "prefill_tok_s_mean",
+              "total_watts", "cpu_temp", "ram_pct", "gpu_fan", "gpu_mem_temp")
 _hist = {k: [] for k in _HIST_KEYS}
 _hist_lock = threading.Lock()
 _agent = {"ok": None, "at": 0.0}
+
+# When a page last asked for live data (/api/stats, /metrics, /api/models or a
+# button). The poller slows down after IDLE_AFTER seconds without one; the
+# event wakes it (and the state.db syncer) as soon as somebody looks again.
+_last_view = time.time()
+_view_event = threading.Event()
+_sync_event = threading.Event()
+
+
+def mark_view():
+    global _last_view
+    was_idle = viewer_idle()
+    _last_view = time.time()
+    if was_idle:
+        _view_event.set()
+        _sync_event.set()
+
+
+def viewer_idle(now=None):
+    return (now or time.time()) - _last_view > IDLE_AFTER
+
+
+def _num(d, key, scale=1):
+    """A probe value as a number, or None when it is missing, empty or garbage.
+
+    The probe prints `key=` with nothing after it whenever a sensor is absent,
+    and the old `int(x or 0)` turned that into a confident 0 °C / 0 W. None
+    lets the page say "–" instead. Floats ("12.5") are fine; scale divides.
+    """
+    v = (d or {}).get(key)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    try:
+        n = float(v) / scale
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(n):
+        return None
+    return int(n) if scale == 1 and n.is_integer() else n
 
 
 def probe_agent():
@@ -545,6 +638,10 @@ _lock = threading.Lock()
 # the other OS costs one wasted ssh attempt and then self-heals. No config.
 _os_kind = None
 
+# ssh errors that mean "the machine is not there", as opposed to "the machine
+# answered but this login is wrong" (which is what the other OS looks like).
+_UNREACHABLE = ("timed out", "no route to host", "network is unreachable", "host is down", "could not resolve")
+
 
 def pc_os():
     """Last known OS of the PC: 'linux', 'windows', or None if never reached."""
@@ -552,34 +649,45 @@ def pc_os():
 
 
 def _probe_kind(kind):
+    """One probe attempt. Returns (dict or None, unreachable)."""
     if kind == "windows":
         target, cmd, tmo = WIN_USER + "@" + HOST, _win_cmd(PROBE_WIN), 25
     else:
         target, cmd, tmo = "root@" + HOST, PROBE, 12
-    r = subprocess.run(["ssh", *SSH_OPTS, target, cmd],
-                       capture_output=True, text=True, timeout=tmo)
+    try:
+        r = subprocess.run(["ssh", *SSH_OPTS, target, cmd],
+                           capture_output=True, text=True, timeout=tmo)
+    except subprocess.TimeoutExpired:
+        return None, True
+    except OSError:
+        return None, False
     if r.returncode != 0:
-        return None
+        return None, any(m in (r.stderr or "").lower() for m in _UNREACHABLE)
     d = {}
     for line in r.stdout.splitlines():
         if "=" in line:
             k, _, v = line.partition("=")
             d[k.strip()] = v.strip()
-    return d or None
+    if d:
+        d["_os"] = kind
+    return d or None, False
 
 
 def probe_pc():
+    """Probe whichever OS the PC runs. A timeout or "no route" on the first try
+    means the box is asleep or off, so the other OS is not tried as well: that
+    would only stack a second timeout onto the same cycle. A login refusal is
+    what the other OS looks like, and that one does fall through."""
     global _os_kind
     order = [_os_kind] if _os_kind else []
     order += [k for k in ("linux", "windows") if k not in order]
     for kind in order:
-        try:
-            d = _probe_kind(kind)
-        except (subprocess.TimeoutExpired, OSError):
-            d = None
+        d, unreachable = _probe_kind(kind)
         if d:
             _os_kind = kind
             return d
+        if unreachable:
+            break
     return None
 
 
@@ -589,40 +697,6 @@ def probe_ollama():
             return json.load(r).get("models", [])
     except Exception:
         return None
-
-
-def probe_strata():
-    """Strata's own monitor data, trimmed to what the page draws.
-
-    Called only while the probe says Strata holds the GPU, so an idle Ollama
-    box costs no extra request. /metrics wants the API key once one is set.
-    """
-    if not STRATA_URL:
-        return None
-    req = urllib.request.Request(STRATA_URL + "/metrics")
-    if STRATA_KEY:
-        req.add_header("Authorization", "Bearer " + STRATA_KEY)
-    try:
-        with urllib.request.urlopen(req, timeout=4) as r:
-            d = json.load(r)
-    except Exception:
-        return None
-    e, live, tot = d.get("engine") or {}, d.get("live") or {}, d.get("totals") or {}
-    reqs = d.get("requests") or []
-    off, acc = tot.get("drafts_offered") or 0, tot.get("drafts_accepted") or 0
-    return {
-        "model": e.get("model"), "version": e.get("version"),
-        "max_context": e.get("max_context") or e.get("context"),
-        "experts": e.get("expert_slots"), "experts_mib": e.get("expert_cache_mib"),
-        "live": {k: live.get(k) for k in ("state", "phase", "queued", "prompt_tokens", "generated",
-                                          "max_tokens", "elapsed_s", "tok_s", "tok_s_mean",
-                                          "prefill_tok_s_mean", "prompt_read", "prompt_total")},
-        "accept": (acc / off) if off else None,
-        "requests_total": tot.get("requests"),
-        "requests": [{k: q.get(k) for k in ("time", "duration_s", "finish", "prompt_tokens", "reused",
-                                            "output_tokens", "decode_tok_s", "hit_rate", "prompt_ms")}
-                     for q in reqs[:8]],
-    }
 
 
 def probe_tokens():
@@ -674,65 +748,80 @@ def probe_tokens():
 # Hermes writes the token counts on the Mac. When the dashboard runs somewhere
 # else (zimaos), pull them across on an interval.
 #
-# Only ONE table is ever read here - session_model_usage, 97 rows - while the
-# full state.db is 11 MB of messages and FTS indexes. So instead of copying the
-# database, export just that table into a throwaway sqlite file: 24 KB, a 450x
-# reduction. Same schema, so probe_tokens() reads it with no special case.
-# That makes the sync cheap enough to run every few seconds, which is the point
-# - it is both far less traffic AND far less lag than the old 5-minute copy.
+# Only ONE table is ever read here - session_model_usage, ~100 rows - while the
+# full state.db is tens of MB of messages and FTS indexes. So one ssh call asks
+# the Mac for `.dump session_model_usage` (~70 KB of SQL, compressed on the
+# wire), and the dump is replayed into a fresh local sqlite file. Same schema,
+# so probe_tokens() reads it with no special case.
 #
-# The export runs as a single sqlite3 statement against a WAL database, so it
-# sees one consistent point in time; the result is landed via os.replace so a
-# reader never observes a half-written file.
+# The same call first prints the mtime:size of state.db and its -wal and stops
+# there when they match the last copy: Hermes idle = no dump at all. .dump runs
+# inside one read transaction, so it sees one consistent point in time; the
+# result is landed via os.replace so a reader never observes a half file.
 #
 # When the Mac is asleep the sync simply fails and the previous copy stays put,
 # so the panel keeps showing the last known numbers. STATE_SYNCED carries the
 # age so the page can label them rather than passing them off as live.
 STATE_SYNC_FROM = os.environ.get("HERMES_STATE_SYNC")      # user@host:/abs/path
 STATE_SYNC_SECONDS = float(os.environ.get("HERMES_STATE_SYNC_SECONDS", "15"))
-STATE_SYNCED = {"at": None, "ok": False, "error": "not configured"}
+# Back-off interval: after a failure, and while nobody has the page open.
+STATE_SYNC_SLOW_SECONDS = 60.0
+STATE_SYNCED = {"at": None, "ok": False, "error": "not configured", "sig": None}
+
+# Prints "SIG <mtime:size of db and -wal>", then either UNCHANGED or the dump.
+# stat -c is GNU, stat -f is BSD/macOS (the Mac), so try one, then the other.
+_SYNC_SH = r"""db=%(db)s
+sig=$(for f in "$db" "$db-wal"; do [ -e "$f" ] && { stat -c '%%Y:%%s' "$f" 2>/dev/null || stat -f '%%m:%%z' "$f"; }; done | paste -s -d ' ' -)
+echo "SIG $sig"
+[ -n "$sig" ] && [ "$sig" = %(prev)s ] && { echo UNCHANGED; exit 0; }
+sqlite3 -readonly "$db" ".dump session_model_usage"
+"""
 
 
 def sync_state_db():
-    """Pull a consistent copy of the Mac's state.db. Returns (ok, error)."""
+    """Refresh the local copy of the Mac's token table. Returns (ok, error)."""
     if not STATE_SYNC_FROM or ":" not in STATE_SYNC_FROM:
         return False, "not configured"
     remote_host, _, remote_path = STATE_SYNC_FROM.partition(":")
-    snap = "/tmp/hermes-tokens-%d.db" % os.getpid()
-    # CREATE TABLE AS drops indexes and constraints, which is fine: every read
-    # against this file is a plain aggregate SELECT.
-    export = (
-        "rm -f {snap} && sqlite3 {db} \"ATTACH '{snap}' AS t; "
-        "CREATE TABLE t.session_model_usage AS SELECT * FROM session_model_usage;\""
-    ).format(snap=snap, db=remote_path)
+    # A missing local copy (fresh container) must not be skipped as "unchanged".
+    prev = STATE_SYNCED.get("sig") if os.path.exists(STATE_DB) else None
+    cmd = _SYNC_SH % {"db": shlex.quote(remote_path), "prev": shlex.quote(prev or "-")}
     try:
-        r = subprocess.run(
-            ["ssh", *SSH_OPTS, remote_host, export],
-            capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            return False, (r.stderr or "export failed").strip().splitlines()[-1][:160]
-        # Land it via a temp file + rename so a reader never sees a half copy.
-        tmp = STATE_DB + ".part"
-        os.makedirs(os.path.dirname(STATE_DB), exist_ok=True)
-        r = subprocess.run(
-            ["scp", *SSH_OPTS, "%s:%s" % (remote_host, snap), tmp],
-            capture_output=True, text=True, timeout=120)
-        if r.returncode != 0:
-            return False, (r.stderr or "scp failed").strip().splitlines()[-1][:160]
-        os.replace(tmp, STATE_DB)
-        # The exported file is self-contained. Any -wal/-shm left over from a
-        # previous copy belongs to a different database now, and sqlite will
-        # happily read a mismatched WAL and hand back stale or corrupt rows.
-        for side in (STATE_DB + "-wal", STATE_DB + "-shm"):
-            try:
-                os.remove(side)
-            except OSError:
-                pass
-        subprocess.run(["ssh", *SSH_OPTS, remote_host, "rm -f " + snap],
-                       capture_output=True, text=True, timeout=20)
-        return True, None
+        r = subprocess.run(["ssh", *SSH_OPTS, "-o", "Compression=yes", remote_host, cmd],
+                           capture_output=True, text=True, timeout=60)
     except (subprocess.TimeoutExpired, OSError) as e:
         return False, str(e)[:160]
+    head, _, dump = r.stdout.partition("\n")
+    if r.returncode != 0 or not head.startswith("SIG "):
+        return False, _last_line(r.stderr, "export failed")
+    sig = head[4:].strip()
+    if dump.startswith("UNCHANGED"):
+        return True, None
+    if "CREATE TABLE session_model_usage" not in dump:
+        return False, _last_line(r.stderr, "no session_model_usage table in the dump")
+    tmp = STATE_DB + ".part"
+    try:
+        os.makedirs(os.path.dirname(STATE_DB) or ".", exist_ok=True)
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        con = sqlite3.connect(tmp)
+        try:
+            con.executescript(dump)
+        finally:
+            con.close()
+        os.replace(tmp, STATE_DB)
+    except (OSError, sqlite3.Error) as e:
+        return False, str(e)[:160]
+    # The new file is self-contained. Any -wal/-shm left over from a previous
+    # copy belongs to a different database now, and sqlite will happily read a
+    # mismatched WAL and hand back stale or corrupt rows.
+    for side in (STATE_DB + "-wal", STATE_DB + "-shm"):
+        try:
+            os.remove(side)
+        except OSError:
+            pass
+    STATE_SYNCED["sig"] = sig
+    return True, None
 
 
 def state_syncer():
@@ -740,219 +829,320 @@ def state_syncer():
     if not STATE_SYNC_FROM:
         return
     while True:
-        ok, err = sync_state_db()
-        STATE_SYNCED.update(ok=ok, error=err)
-        if ok:
-            STATE_SYNCED["at"] = time.time()
-        time.sleep(STATE_SYNC_SECONDS)
+        ok = False
+        try:
+            ok, err = sync_state_db()
+            STATE_SYNCED.update(ok=ok, error=err)
+            if ok:
+                STATE_SYNCED["at"] = time.time()
+        except Exception as e:
+            traceback.print_exc(file=sys.stderr)
+            STATE_SYNCED.update(ok=False, error=("sync crashed: %s" % e)[:160])
+        slow = not ok or viewer_idle()
+        _sync_event.wait(STATE_SYNC_SLOW_SECONDS if slow else STATE_SYNC_SECONDS)
+        _sync_event.clear()
+
+
+# --- turning probe output into numbers -------------------------------------
+
+def _cpu_stat(pc):
+    """(total, idle) jiffies from the probe's /proc/stat line, or None."""
+    try:
+        f = [int(x) for x in (pc.get("cpu_stat") or "").split()[1:]]
+    except (TypeError, ValueError):
+        return None
+    if len(f) < 4:
+        return None
+    return sum(f), f[3] + (f[4] if len(f) > 4 else 0)
+
+
+def cpu_deltas(prev, pc, now, max_gap):
+    """CPU watts and busy % from two consecutive probes. Returns (watts, pct, state).
+
+    Both figures are deltas of cumulative counters, so they are only honest when
+    the two samples belong together. Start over (no figure this cycle) when the
+    PC was unreachable, rebooted (uptime went down), switched OS (the Windows
+    counters are a different scale), or when the gap is too long to mean "now".
+    A negative energy delta is a counter wrap only if the old value sat near the
+    top of the range; anything else is a reset and just re-seeds.
+    """
+    if not pc:
+        return None, None, None
+    ns = _num(pc, "now_ns")
+    cur = {"os": pc.get("_os"), "uptime": _num(pc, "uptime"), "wall": now,
+           "t": ns / 1e9 if ns else None, "energy": _num(pc, "cpu_energy"),
+           "max": _num(pc, "cpu_energy_max"), "stat": _cpu_stat(pc)}
+    if (prev is None or prev["os"] != cur["os"] or now - prev["wall"] > max_gap
+            or (cur["uptime"] is not None and prev["uptime"] is not None
+                and cur["uptime"] < prev["uptime"])):
+        return None, None, cur
+    watts = pct = None
+    e, pe = cur["energy"], prev["energy"]
+    if e is not None and pe is not None:
+        # The PC's own clock read beside the counter, else this host's.
+        dt = (cur["t"] - prev["t"]) if cur["t"] and prev["t"] else (now - prev["wall"])
+        de = e - pe
+        if de < 0:
+            rng = cur["max"] or prev["max"]
+            de = de + rng if rng and pe > 0.9 * rng else None
+        if de is not None and dt > 0:
+            watts = de / 1e6 / dt
+    if cur["stat"] and prev["stat"]:
+        dtot, didle = cur["stat"][0] - prev["stat"][0], cur["stat"][1] - prev["stat"][1]
+        if dtot > 0:
+            pct = max(0.0, min(100.0, 100.0 * (1 - didle / dtot)))
+    return watts, pct, cur
+
+
+def gpu_temps(pc):
+    """(junction, mem, edge, junction crit) in °C from the labelled hwmon sensors.
+
+    Junction is the hottest point of the die and what throttles, so it is the
+    headline temperature. Without labels (other drivers), the hottest sensor.
+    """
+    temps = {k[len("gpu_temp_"):]: _num(pc, k, 1000) for k in pc
+             if k.startswith("gpu_temp_") and not k.endswith("_crit")}
+    vals = [v for v in temps.values() if v is not None]
+    junction = temps.get("junction")
+    if junction is None:
+        junction = max(vals) if vals else _num(pc, "gpu_temp", 1000)
+    return junction, temps.get("mem"), temps.get("edge"), _num(pc, "gpu_temp_junction_crit", 1000)
+
+
+_PCIE_GEN = {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}
+
+
+def pcie_info(pc):
+    """The GPU's slot link as numbers plus one label, e.g. "Gen3 x16 · 8 GT/s"."""
+    speed, width = _num(pc, "pcie_speed"), _num(pc, "pcie_width")
+    mspeed, mwidth = _num(pc, "pcie_max_speed"), _num(pc, "pcie_max_width")
+    gen = _PCIE_GEN.get(float(speed)) if speed else None
+    gen_max = _PCIE_GEN.get(float(mspeed)) if mspeed else None
+    link = None
+    if speed and width:
+        link = "%sx%d · %s GT/s" % (("Gen%d " % gen) if gen else "", width, ("%g" % speed))
+    return {"pcie_gen": gen, "pcie_gen_max": gen_max, "pcie_width": width, "pcie_width_max": mwidth,
+            "pcie_speed": speed, "pcie_link": link}
+
+
+def pc_stats(pc, cpu_watts, cpu_pct):
+    """snap["pc"]: every figure is a number, or None when the probe had nothing."""
+    mt, ma = _num(pc, "mem_total"), _num(pc, "mem_avail")
+    mem_used = (mt - ma) * 1024 if mt is not None and ma is not None else None
+    junction, mem_t, edge, crit = gpu_temps(pc)
+    gpu_w = _num(pc, "gpu_power", 1e6)
+    total = ((cpu_watts + gpu_w + SYSTEM_OVERHEAD_W) / PSU_EFFICIENCY
+             if cpu_watts is not None and gpu_w is not None else None)
+    p = {
+        "os": pc.get("_os"),
+        "busy": _num(pc, "gpu_busy"),
+        "vram_used": _num(pc, "vram_used"), "vram_total": _num(pc, "vram_total") or None,
+        "temp": junction, "temp_mem": mem_t, "temp_edge": edge, "temp_crit": crit,
+        "power": gpu_w, "power_cap": _num(pc, "gpu_power_cap", 1e6) or None,
+        "fan": _num(pc, "gpu_fan"), "fan_max": _num(pc, "gpu_fan_max") or None,
+        "mem_used": mem_used, "mem_total": mt * 1024 if mt is not None else None,
+        "ram_pct": 100.0 * mem_used / (mt * 1024) if mem_used is not None and mt else None,
+        "load": _num(pc, "load"),
+        "uptime": _num(pc, "uptime"),
+        "cpu_model": pc.get("cpu_model") or None,
+        "ncpu": _num(pc, "ncpu"),
+        "cpu_watts": cpu_watts,
+        "cpu_pct": cpu_pct,
+        "cpu_temp": _num(pc, "cpu_temp", 1000) or None,
+        "cpu_freq": _num(pc, "cpu_freq", 1e6) or None,
+        "cpu_freq_max": _num(pc, "cpu_freq_max", 1e6) or None,
+        "total_watts": total,
+    }
+    p.update(pcie_info(pc))
+    return p
+
+
+def last_ollama_request(pc, now):
+    """The last completed Ollama response as one Strata-style request row, or None.
+
+    llama-server logs prompt and generation timings when a response ends, so
+    this is all the page can know about it: no finish reason, no cache reuse.
+    """
+    gts, rate = _num(pc, "gen_ts"), _num(pc, "gen_rate")
+    if not gts or not rate or rate <= 0 or now - gts > 7200:
+        return None
+    gms, pms = _num(pc, "gen_ms"), _num(pc, "prompt_ms")
+    return {"time": gts, "decode_tok_s": rate, "output_tokens": _num(pc, "gen_tokens"),
+            "prompt_tokens": _num(pc, "prompt_tokens"), "prompt_ms": pms, "reused": None,
+            "duration_s": ((gms or 0) + (pms or 0)) / 1000 if gms is not None else None,
+            "finish": None, "hit_rate": None}
+
+
+def poll_once(st, t0):
+    """One poller cycle: probe everything and return the new snapshot.
+
+    st carries what must survive between cycles (the CPU counter samples).
+    The PC probe is the slow one, so Ollama and the agent check run beside it.
+    """
+    f_oll = _pool.submit(probe_ollama)
+    f_agent = _pool.submit(probe_agent)
+    pc = probe_pc()
+    tok = probe_tokens()
+    oll, agent = f_oll.result(), f_agent.result()
+
+    cpu_watts, cpu_pct, st["cpu"] = cpu_deltas(st.get("cpu"), pc, t0, 3 * st.get("interval", POLL_SECONDS))
+
+    # True generation rate from Ollama's llama-server timings (via probe_pc).
+    # gen_ts is when the last response finished, so gen_age tells the page how
+    # fresh it is. A rate older than an hour is dropped: the box has been idle
+    # and "last response 3h ago" is just noise.
+    gen_rate = gen_age = None
+    gr, gts = _num(pc, "gen_rate"), _num(pc, "gen_ts")
+    if gr and gts and gr > 0 and (t0 - gts) < 3600:
+        gen_rate, gen_age = gr, max(0.0, t0 - gts)
+
+    # Which engine has the GPU. "loading" while Strata reads its weights.
+    # Strata logs nothing to the journal, so while it generates its own
+    # live rate stands in for the Ollama journal figure above.
+    engine = None
+    if pc and pc.get("engine_avail") == "1":
+        if pc.get("engine_strata") in ("active", "activating"):
+            engine = {"active": "strata",
+                      "state": pc.get("strata_state") or "loading",
+                      "model": pc.get("strata_model") or "strata"}
+            tps = _num(pc, "strata_tok_s")
+            if engine["state"] == "generating" and tps and tps > 0:
+                gen_rate, gen_age = tps, 0.0
+        elif pc.get("engine_ollama") in ("active", "activating"):
+            engine = {"active": "ollama", "state": "ready" if pc["engine_ollama"] == "active" else "loading"}
+        elif pc.get("engine_h3") in ("active", "activating"):
+            # the H3 video server borrowed the GPU; it hands it back by itself after the videos
+            engine = {"active": "h3", "state": "rendering" if pc.get("h3_state") == "rendering" else "ready"}
+        else:
+            engine = {"active": None, "state": "none"}
+
+    # on / off / mixed for the monitors, or None when it cannot be known
+    # (PC unreachable, booted into Windows, or no display attached at all).
+    monitors = None
+    if pc:
+        m_on, m_off = _num(pc, "mon_on") or 0, _num(pc, "mon_off") or 0
+        monitors = "mixed" if m_on and m_off else "on" if m_on else "off" if m_off else None
+
+    snap = {"ok": True, "stale": False, "ts": t0,
+            "online": pc is not None or oll is not None,
+            "monitors": monitors,
+            "engine": engine,
+            "strata_models": strata_models(pc),
+            "strata_default": (pc or {}).get("strata_model") or "strata",
+            # Strata's own page, linked from the header while it runs.
+            # The key is deliberately not passed to the browser.
+            "strata_url": STRATA_URL or None,
+            # Lighting preset, or None when it cannot be known: PC down,
+            # booted into Windows, or OpenRGB not set up on it.
+            "rgb": ((pc.get("rgb") or None)
+                    if pc and pc.get("rgb_avail") == "1" else None),
+            "rgb_auto": ((pc.get("rgb_auto") == "active")
+                         if pc and pc.get("rgb_avail") == "1" else None),
+            # ssh reachable, so GPU/CPU/RAM figures are available.
+            "host_stats": pc is not None,
+            "gen_rate": gen_rate, "gen_age": gen_age,
+            "gen_ts": gts if gen_rate is not None and gts else None,
+            # The last finished Ollama response, for the Monitor's request table.
+            "last_request": last_ollama_request(pc, t0) if pc else None,
+            "home": on_home_lan(), "relay": RELAY_HOST,
+            # The poller's current cadence: POLL_SECONDS, or IDLE_POLL_SECONDS
+            # while nobody watches.
+            "poll_s": st.get("interval", POLL_SECONDS),
+            # Age of the token numbers. None when this host owns state.db
+            # directly (the Mac), a number of seconds when it is a synced
+            # copy, so the page can say so instead of implying live data.
+            "tokens_age": (None if not STATE_SYNC_FROM else
+                           (None if not STATE_SYNCED["at"]
+                            else t0 - STATE_SYNCED["at"])),
+            "tokens_sync_error": STATE_SYNCED["error"] if STATE_SYNC_FROM else None,
+            "agent": agent}
+
+    if pc:
+        snap["pc"] = pc_stats(pc, cpu_watts, cpu_pct)
+    if oll is not None:
+        snap["ollama"] = [{
+            "name": m["name"], "vram": m.get("size_vram", 0),
+            "ctx": m.get("context_length", 0),
+            "params": m.get("details", {}).get("parameter_size", "?"),
+            "quant": m.get("details", {}).get("quantization_level", "?"),
+            "expires": m.get("expires_at"),
+        } for m in oll]
+    if tok:
+        c, ti, to, cr, cw, rz, ns = tok["tot"]
+        snap["tokens"] = {
+            "calls": c, "in": ti, "out": to, "cache_read": cr,
+            "cache_write": cw, "reasoning": rz, "sessions": ns,
+            "models": [{"name": m[0], "calls": m[1], "in": m[2],
+                        "out": m[3], "cached": m[4]} for m in tok["models"]],
+        }
+        if tok["cur"]:
+            sid, model, cc, ci, co, cch, fs, ls = tok["cur"]
+            snap["tokens"]["current"] = {
+                "id": sid, "model": model, "calls": cc, "in": ci, "out": co,
+                "cached": cch, "span": max(1.0, (ls or 0) - (fs or 0)),
+                "idle": time.time() - (ls or 0),
+            }
+
+    # One sample per series; all None while the PC cannot be reached.
+    sample = {}
+    p = snap.get("pc")
+    if p:
+        sample = {"gpu_util": p["busy"], "gpu_mem_used": p["vram_used"], "gpu_temp": p["temp"],
+                  "gpu_power": p["power"], "cpu": p["cpu_pct"],
+                  "tok_s": live_tok_s(snap) or 0,
+                  "total_watts": p["total_watts"], "cpu_temp": p["cpu_temp"], "ram_pct": p["ram_pct"],
+                  "gpu_fan": p["fan"], "gpu_mem_temp": p["temp_mem"]}
+    with _hist_lock:
+        for k in _HIST_KEYS:
+            _hist[k].append(sample.get(k))
+            del _hist[k][:-120]
+    return snap
+
+
+def live_tok_s(s):
+    """The decode rate to show as "now", or None when nothing is generating.
+
+    Strata's own live rate while it generates. For Ollama the journal only has
+    the rate of a response that already finished, so it counts as "now" only
+    when it is seconds old AND the GPU is still busy (a follow-up running).
+    """
+    e = s.get("engine") or {}
+    if e.get("active") == "strata":
+        return s.get("gen_rate") if e.get("state") == "generating" else None
+    busy = (s.get("pc") or {}).get("busy")
+    age = s.get("gen_age")
+    if s.get("gen_rate") and age is not None and age < 5 and busy is not None and busy > 40:
+        return s["gen_rate"]
+    return None
+
+
+_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="probe")
 
 
 def poller():
-    """Background loop. Owns all the slow I/O so HTTP stays instant."""
-    # Hermes only writes token counts when an API call finishes, so a 2s delta
-    # reads zero almost every tick and spikes once per call. Average over a
-    # longer window instead, against the all-time total (monotonic, and it
-    # survives the session id changing mid-stream).
-    hist = []
-    prev_energy = prev_energy_t = None
-    prev_stat = None
+    """Background loop. Owns all the slow I/O so HTTP stays instant.
+
+    A failing cycle must not kill the thread (the page would freeze on the last
+    snapshot forever): the traceback goes to stderr, the last good data stays,
+    and the snapshot is flagged ok=False / stale=True with the error until the
+    next good cycle. "ts" keeps the time of that last good data.
+    """
+    st = {"cpu": None, "interval": POLL_SECONDS}
     while True:
         t0 = time.time()
-        pc, oll, tok = probe_pc(), probe_ollama(), probe_tokens()
-
-        # RAPL reports cumulative microjoules; watts is the delta over time.
-        cpu_watts = cpu_pct = None
-        if pc:
-            try:
-                e = int(pc.get("cpu_energy") or 0)
-                if prev_energy is not None and e:
-                    de, dt = e - prev_energy, t0 - prev_energy_t
-                    if de < 0:                      # counter wrapped
-                        de += int(pc.get("cpu_energy_max") or 0)
-                    if dt > 0 and de >= 0:
-                        cpu_watts = de / 1e6 / dt
-                if e:
-                    prev_energy, prev_energy_t = e, t0
-            except (TypeError, ValueError):
-                pass
-            try:
-                f = [int(x) for x in (pc.get("cpu_stat") or "").split()[1:]]
-                if f:
-                    total, idle = sum(f), f[3] + (f[4] if len(f) > 4 else 0)
-                    if prev_stat:
-                        dt_, di = total - prev_stat[0], idle - prev_stat[1]
-                        if dt_ > 0:
-                            cpu_pct = max(0.0, min(100.0, 100.0 * (1 - di / dt_)))
-                    prev_stat = (total, idle)
-            except (TypeError, ValueError, IndexError):
-                pass
-
-        rate = None
-        if tok:
-            total_out = tok["tot"][2]
-            hist.append((t0, total_out))
-            cutoff = t0 - RATE_WINDOW
-            while len(hist) > 2 and hist[0][0] < cutoff:
-                hist.pop(0)
-            if len(hist) >= 2:
-                dt = t0 - hist[0][0]
-                d = total_out - hist[0][1]
-                if dt >= 2.0 and d > 0:
-                    rate = d / dt
-
-        # True generation rate from Ollama's llama-server timings (via probe_pc).
-        # gen_ts is when the last response finished, so gen_age tells the page how
-        # fresh it is; the poll runs on POLL_SECONDS so this refreshes promptly.
-        gen_rate = gen_age = None
-        if pc:
-            try:
-                gr = float(pc.get("gen_rate") or 0)
-                gts = float(pc.get("gen_ts") or 0)
-                # Ignore a rate older than an hour: past that the box has been
-                # idle and "last response 3h ago" is just noise, so fall to idle.
-                if gr > 0 and gts > 0 and (t0 - gts) < 3600:
-                    gen_rate, gen_age = gr, max(0.0, t0 - gts)
-            except (TypeError, ValueError):
-                pass
-
-        # Which engine has the GPU. "loading" while Strata reads its weights.
-        # Strata logs nothing to the journal, so while it generates its own
-        # live rate stands in for the Ollama journal figure above.
-        engine = None
-        if pc and pc.get("engine_avail") == "1":
-            if pc.get("engine_strata") in ("active", "activating"):
-                engine = {"active": "strata",
-                          "state": pc.get("strata_state") or "loading",
-                          "model": pc.get("strata_model") or "strata"}
-                try:
-                    tps = float(pc.get("strata_tok_s") or 0)
-                except ValueError:
-                    tps = 0
-                if engine["state"] == "generating" and tps > 0:
-                    gen_rate, gen_age = tps, 0.0
-            elif pc.get("engine_ollama") in ("active", "activating"):
-                engine = {"active": "ollama", "state": "ready"}
-            elif pc.get("engine_h3") in ("active", "activating"):
-                # the H3 video server borrowed the GPU; it hands it back by itself after the videos
-                engine = {"active": "h3", "state": "rendering" if pc.get("h3_state") == "rendering" else "ready"}
-            else:
-                engine = {"active": None, "state": "none"}
-        strata = None     # the page reads Strata's /metrics itself, through this server
-        if strata and engine["state"] == "generating" and strata["live"].get("tok_s"):
-            # /metrics' rate is the same window Strata's own page shows.
-            gen_rate, gen_age = strata["live"]["tok_s"], 0.0
-
-        # on / off / mixed for the monitors, or None when it cannot be known
-        # (PC unreachable, booted into Windows, or no display attached at all).
-        monitors = None
-        if pc:
-            try:
-                m_on = int(pc.get("mon_on") or 0)
-                m_off = int(pc.get("mon_off") or 0)
-                if m_on and m_off:
-                    monitors = "mixed"
-                elif m_on:
-                    monitors = "on"
-                elif m_off:
-                    monitors = "off"
-            except (TypeError, ValueError):
-                pass
-
-        snap = {"ok": True, "ts": t0,
-                "online": pc is not None or oll is not None,
-                "monitors": monitors,
-                "engine": engine,
-                "strata_models": strata_models(pc),
-                "strata_default": (pc or {}).get("strata_model") or "strata",
-                "strata": strata,
-                # Strata's own page, linked from the header while it runs.
-                # The key is deliberately not passed to the browser.
-                "strata_url": STRATA_URL or None,
-                # Lighting preset, or None when it cannot be known: PC down,
-                # booted into Windows, or OpenRGB not set up on it.
-                "rgb": ((pc.get("rgb") or None)
-                        if pc and pc.get("rgb_avail") == "1" else None),
-                "rgb_auto": ((pc.get("rgb_auto") == "active")
-                             if pc and pc.get("rgb_avail") == "1" else None),
-                # ssh reachable, so GPU/CPU/RAM figures are available.
-                "host_stats": pc is not None,
-                "rate": rate,
-                "gen_rate": gen_rate, "gen_age": gen_age,
-                "home": on_home_lan(), "relay": RELAY_HOST,
-                "window": RATE_WINDOW,
-                # Age of the token numbers. None when this host owns state.db
-                # directly (the Mac), a number of seconds when it is a synced
-                # copy, so the page can say so instead of implying live data.
-                "tokens_age": (None if not STATE_SYNC_FROM else
-                               (None if not STATE_SYNCED["at"]
-                                else t0 - STATE_SYNCED["at"])),
-                "tokens_sync_error": STATE_SYNCED["error"] if STATE_SYNC_FROM else None}
-
-        if pc:
-            vt = int(pc.get("vram_total", 1) or 1)
-            mt = int(pc.get("mem_total", 1) or 1)
-            ma = int(pc.get("mem_avail", 0) or 0)
-            top = [p for p in (pc.get("top", "") or "").split("|") if p.strip()]
-            snap["pc"] = {
-                "busy": float(pc.get("gpu_busy", 0) or 0),
-                "vram_used": int(pc.get("vram_used", 0) or 0), "vram_total": vt,
-                "temp": int(pc.get("gpu_temp", 0) or 0) / 1000,
-                "power": int(pc.get("gpu_power", 0) or 0) / 1e6,
-                "power_cap": int(pc.get("gpu_power_cap", 0) or 0) / 1e6 or None,
-                "fan": int(pc.get("gpu_fan", 0) or 0),
-                "mem_used": (mt - ma) * 1024, "mem_total": mt * 1024,
-                "load": float(pc.get("load", 0) or 0),
-                "uptime": int(pc.get("uptime", 0) or 0),
-                "top": top,
-                "cpu_model": pc.get("cpu_model", ""),
-                "ncpu": int(pc.get("ncpu", 0) or 0),
-                "cpu_watts": cpu_watts,
-                "cpu_pct": cpu_pct,
-                "cpu_temp": int(pc.get("cpu_temp", 0) or 0) / 1000 or None,
-                "cpu_freq": int(pc.get("cpu_freq", 0) or 0) / 1e6 or None,
-            }
-            gw = snap["pc"]["power"] if "pc" in snap else 0
-            if cpu_watts is not None:
-                snap["pc"]["total_watts"] = (
-                    cpu_watts + gw + SYSTEM_OVERHEAD_W) / PSU_EFFICIENCY
-        if oll is not None:
-            snap["ollama"] = [{
-                "name": m["name"], "vram": m.get("size_vram", 0),
-                "ctx": m.get("context_length", 0),
-                "params": m.get("details", {}).get("parameter_size", "?"),
-                "quant": m.get("details", {}).get("quantization_level", "?"),
-                "expires": m.get("expires_at"),
-            } for m in oll]
-        if tok:
-            c, ti, to, cr, cw, rz, ns = tok["tot"]
-            snap["tokens"] = {
-                "calls": c, "in": ti, "out": to, "cache_read": cr,
-                "cache_write": cw, "reasoning": rz, "sessions": ns,
-                "models": [{"name": m[0], "calls": m[1], "in": m[2],
-                            "out": m[3], "cached": m[4]} for m in tok["models"]],
-            }
-            if tok["cur"]:
-                sid, model, cc, ci, co, cch, fs, ls = tok["cur"]
-                snap["tokens"]["current"] = {
-                    "id": sid, "model": model, "calls": cc, "in": ci, "out": co,
-                    "cached": cch, "span": max(1.0, (ls or 0) - (fs or 0)),
-                    "idle": time.time() - (ls or 0),
-                }
-
-        snap["agent"] = probe_agent()
-        if "pc" in snap:
-            p = snap["pc"]
-            sample = {"gpu_util": p["busy"], "gpu_mem_used": p["vram_used"], "gpu_temp": p["temp"],
-                      "gpu_power": p["power"], "cpu": p["cpu_pct"], "tok_s": gen_rate if gen_rate and gen_age == 0 else
-                      (gen_rate if gen_rate and gen_age is not None and gen_age < 5 else 0)}
-            with _hist_lock:
-                for k in _HIST_KEYS:
-                    _hist[k].append(sample.get(k))
-                    del _hist[k][:-120]
-        with _lock:
-            _snapshot.clear()
-            _snapshot.update(snap)
-        time.sleep(max(0.2, POLL_SECONDS - (time.time() - t0)))
+        try:
+            snap = poll_once(st, t0)
+            with _lock:
+                _snapshot.clear()
+                _snapshot.update(snap)
+        except Exception as e:
+            traceback.print_exc(file=sys.stderr)
+            with _lock:
+                _snapshot.update(ok=False, stale=True, error=("poller: %s" % e)[:200],
+                                 error_ts=time.time())
+        st["interval"] = IDLE_POLL_SECONDS if viewer_idle() else POLL_SECONDS
+        _view_event.wait(max(0.2, st["interval"] - (time.time() - t0)))
+        _view_event.clear()
 
 
 # --- the page ----------------------------------------------------------------
@@ -989,10 +1179,22 @@ FAVICON_SVG = (b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><re
 # Strata's page talks to these (relative) paths.
 STRATA_PATHS = ("health", "api/health", "metrics", "status", "config", "settings", "mcp",
                 "models", "props", "slots", "load", "unload")
-# Paths that run the model, run tools or change settings: tailnet devices only.
-# The dashboard is also reachable from the home Wi-Fi with no login, and the
-# Hermes agent behind the chat has a terminal on the Mac.
-CONTROL_PATHS = ("v1/", "config", "settings", "load", "unload", "mcp", "api/chats", "api/builder", "api/video")
+# Paths that run the model, run tools, change settings or drive the PC (power,
+# engine, monitors, lights): tailnet devices only. The dashboard is also
+# reachable from the home Wi-Fi with no login, and the Hermes agent behind the
+# chat has a terminal on the Mac. api/wake stays open on purpose: the Mac's copy
+# and the zimaos relay call it, and waking a sleeping PC is harmless.
+CONTROL_PATHS = ("v1/", "config", "settings", "load", "unload", "mcp", "slots", "props",
+                 "api/chats", "api/builder", "api/video",
+                 "api/power", "api/engine", "api/display", "api/rgb", "api/rgbauto")
+
+# Host names a request may arrive under, besides IP literals, localhost, bare
+# MagicDNS names (no dot) and *.ts.net. Anything else is DNS rebinding: a page
+# on some domain that was re-pointed at this box. Also the extra Origins (by
+# host) allowed to send writes. Comma list, e.g. "dash.example.org".
+ALLOWED_HOSTS = {h.strip().lower() for h in os.environ.get("HERMES_ALLOWED_HOSTS", "").split(",") if h.strip()}
+# A chat with a picture or a video's start frame is base64 inside JSON: a few MB.
+MAX_BODY = 64 * 1024 * 1024
 
 # h3-engine ("Video" tab): MiniMax H3 text/image-to-video on the PC. It borrows the GPU from
 # Strata/Ollama per video and gives it back by itself. Key added here, never sent to the browser.
@@ -1036,10 +1238,17 @@ def system_note(model, pictures, research):
     return note + ("\n\n" + RESEARCH_NOTE if research else "")
 
 
+# A phrase only the dashboard's own note contains. Matching on it (not on "You
+# are ...") keeps a system prompt the user wrote, which may well start that way.
+IDENTITY_MARK = "reached through his private web dashboard"
+assert IDENTITY_MARK in IDENTITY_NOTE
+
+
 def with_system(body, note):
     """The dashboard's note first; drop a copy of an earlier note so a resent chat doesn't stack them."""
-    msgs = [m for m in body.get("messages") or [] if not (m.get("role") == "system" and (
-        m.get("content") == RESEARCH_NOTE or str(m.get("content", "")).startswith("You are ")))]
+    msgs = [m for m in body.get("messages") or [] if not (
+        isinstance(m, dict) and m.get("role") == "system" and (
+            m.get("content") == RESEARCH_NOTE or IDENTITY_MARK in str(m.get("content", ""))))]
     body["messages"] = [{"role": "system", "content": note}] + msgs
 
 
@@ -1156,6 +1365,94 @@ def _snap():
         return dict(_snapshot)
 
 
+def _split_host(netloc):
+    """("name", "port") from "name:port", "[v6]:port" or a bare name; lower-cased."""
+    h = (netloc or "").strip().lower()
+    if h.startswith("["):
+        name, _, rest = h[1:].partition("]")
+        return name, rest.lstrip(":")
+    if h.count(":") == 1:
+        name, _, port = h.partition(":")
+        return name, port
+    return h, ""
+
+
+def _host_ok(host):
+    """Is this Host header one this dashboard can legitimately be reached by?"""
+    name, port = _split_host(host)
+    if not name:
+        return False
+    if name in ALLOWED_HOSTS or ("%s:%s" % (name, port)) in ALLOWED_HOSTS:
+        return True
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    return name == "localhost" or "." not in name or name.endswith(".ts.net")
+
+
+def _same_netloc(a, b):
+    """host:port equality, ignoring scheme and the scheme's default port."""
+    na, pa = _split_host(a)
+    nb, pb = _split_host(b)
+    pa = "" if pa in ("80", "443") else pa
+    pb = "" if pb in ("80", "443") else pb
+    return bool(na) and (na, pa) == (nb, pb)
+
+
+def _request_allowed(method, path, headers, client_ip):
+    """None when the request may proceed, else (status, message). Runs before any body is read.
+
+    - Control paths (and every PUT/DELETE) only from the tailnet or this host.
+    - Writes and control paths must name a Host this box is known by: stops
+      DNS rebinding, where a hostile domain is re-pointed at the dashboard.
+    - A browser's Origin, when sent, must be the dashboard itself: stops
+      another site's page posting to it (CSRF). Server-to-server callers (the
+      wake relay, the h3 skill, curl) send no Origin and are unaffected.
+      Behind `tailscale serve` (client = loopback) X-Forwarded-Host counts too.
+    - A body must be JSON and at most MAX_BODY: a cross-site form can only send
+      text/plain or form types without a CORS preflight, and nothing here
+      takes those.
+    """
+    h = {str(k).lower(): v for k, v in (headers.items() if hasattr(headers, "items") else [])}
+    control = path.startswith(CONTROL_PATHS)
+    write = method in ("POST", "PUT", "DELETE")
+    if (control or method in ("PUT", "DELETE")) and not _tailnet(client_ip):
+        if method == "POST":
+            return 403, ("Chat, model settings and PC controls only from a Tailscale device — "
+                         "the agent behind them can run commands on the Mac.")
+        return 403, "Only from a Tailscale device."
+    if write or control:
+        host = h.get("host") or ""
+        if host and not _host_ok(host):
+            return 403, "Unknown Host header. Add it to HERMES_ALLOWED_HOSTS if this name is yours."
+        origin = h.get("origin")
+        if origin is not None:
+            o = urllib.parse.urlsplit(origin.strip().lower())
+            fwd = h.get("x-forwarded-host") if client_ip in ("127.0.0.1", "::1") else None
+            ok = bool(o.scheme and o.netloc) and (
+                _same_netloc(o.netloc, host) or (fwd and _same_netloc(o.netloc, fwd.split(",")[0]))
+                or (o.hostname or "") in ALLOWED_HOSTS or o.netloc in ALLOWED_HOSTS)
+            if not ok:
+                return 403, "Cross-site request refused."
+    if method in ("POST", "PUT"):
+        raw_len = (h.get("content-length") or "0").strip()
+        try:
+            n = int(raw_len)
+        except ValueError:
+            return 400, "bad Content-Length"
+        if n < 0:
+            return 400, "bad Content-Length"
+        if n > MAX_BODY:
+            return 413, "request body too large"
+        if n:
+            ctype = (h.get("content-type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                return 415, "send JSON (Content-Type: application/json)"
+    return None
+
+
 def strata_up(s=None):
     s = s or _snap()
     e = s.get("engine") or {}
@@ -1168,7 +1465,22 @@ def ollama_model(s):
     return m[0]["name"] if m else OLLAMA_CHAT_MODEL
 
 
-def installed_models(s):
+# Ollama's /api/tags, kept for a short while: every Ollama chat checks the
+# chosen model against it, and that list only changes on a pull or a delete.
+_tags_cache = {"at": 0.0, "models": None}
+TAGS_MAX_AGE = 30.0
+
+
+def _ollama_tags(max_age):
+    if _tags_cache["models"] is not None and time.time() - _tags_cache["at"] < max_age:
+        return _tags_cache["models"]
+    with urllib.request.urlopen(OLLAMA + "/api/tags", timeout=6) as r:
+        models = json.load(r).get("models", [])
+    _tags_cache.update(at=time.time(), models=models)
+    return models
+
+
+def installed_models(s, max_age=0.0):
     """Installed models for the engine holding the GPU, including unloaded Ollama models."""
     engine = (s.get("engine") or {}).get("active")
     if not s.get("online"):
@@ -1183,8 +1495,7 @@ def installed_models(s):
                          "or choose an engine under Manage.")
     if engine != "ollama":
         raise ValueError("No model engine is ready. Choose one under Manage.")
-    with urllib.request.urlopen(OLLAMA + "/api/tags", timeout=6) as r:
-        models = json.load(r).get("models", [])
+    models = _ollama_tags(max_age)
     data = [{"id": m["name"], "object": "model",
              "params": (m.get("details") or {}).get("parameter_size"),
              "size": m.get("size")} for m in models if m.get("name")]
@@ -1206,24 +1517,59 @@ def synth_health(s):
             "max_context": (m[0].get("ctx") if m else 0) or 0, "service": "dashboard"}
 
 
+def hardware(p, tok_s=None):
+    """Strata's /metrics "hardware" block from snap["pc"]; None wherever the probe had nothing.
+
+    The gpu_pcie_* names are the ones the PCIe card reads. amdgpu exposes no
+    PCIe throughput counter, so gpu_pcie_rx_mb (and disk) stay None.
+    """
+    if not p:
+        return {}
+    return {"gpu_util": p.get("busy"), "gpu_mem_used": p.get("vram_used"), "gpu_mem_total": p.get("vram_total"),
+            "gpu_temp": p.get("temp"), "gpu_mem_temp": p.get("temp_mem"), "gpu_edge_temp": p.get("temp_edge"),
+            "gpu_temp_crit": p.get("temp_crit"),
+            "gpu_power": p.get("power"), "gpu_power_limit": p.get("power_cap"),
+            "gpu_fan": p.get("fan"), "gpu_fan_max": p.get("fan_max"),
+            "gpu_pcie_gen": p.get("pcie_gen"), "gpu_pcie_gen_max": p.get("pcie_gen_max"),
+            "gpu_pcie_width": p.get("pcie_width"), "gpu_pcie_width_max": p.get("pcie_width_max"),
+            "gpu_pcie_link": p.get("pcie_link"), "gpu_pcie_rx_mb": None, "gpu_pcie_tx_mb": None,
+            "disk_read_mb": None, "disk_write_mb": None,
+            "cpu": p.get("cpu_pct"), "cpu_temp": p.get("cpu_temp"),
+            "cpu_freq": p.get("cpu_freq"), "cpu_freq_max": p.get("cpu_freq_max"),
+            "cpu_watts": p.get("cpu_watts"), "total_watts": p.get("total_watts"),
+            "ram_used": p.get("mem_used"), "ram_total": p.get("mem_total"), "ram_pct": p.get("ram_pct"),
+            "tok_s": tok_s}
+
+
+def live_state(s, tok_s):
+    """The Monitor's state word when the dashboard (not Strata) answers /metrics."""
+    e = s.get("engine") or {}
+    if not s.get("online"):
+        return "asleep"
+    if e.get("active") == "h3" and e.get("state") == "rendering":
+        return "rendering"
+    if e.get("state") in ("loading", "activating"):
+        return "loading"
+    return "generating" if tok_s else "idle"
+
+
 def synth_metrics(s):
     """Strata's /metrics shape, filled from this dashboard's probe — for Ollama and loading/asleep."""
     p = s.get("pc") or {}
-    gen = s.get("gen_rate") if (s.get("gen_age") is not None and s["gen_age"] < 5 and p.get("busy", 0) > 40) else None
-    live = {"state": "generating" if gen else "idle", "queued": 0, "tok_s": gen, "phase": None,
+    gen = live_tok_s(s)
+    live = {"state": live_state(s, gen), "engine": (s.get("engine") or {}).get("active"),
+            "queued": 0, "tok_s": gen, "phase": None,
             "prompt_tokens": None, "generated": None, "max_tokens": None, "prefill_tok_s_mean": None}
-    hw = {}
-    if p:
-        hw = {"gpu_util": p.get("busy"), "gpu_mem_used": p.get("vram_used"), "gpu_mem_total": p.get("vram_total"),
-              "gpu_temp": p.get("temp"), "gpu_power": p.get("power"), "gpu_power_limit": p.get("power_cap"),
-              "cpu": p.get("cpu_pct"), "ram_used": p.get("mem_used"), "ram_total": p.get("mem_total"),
-              "tok_s": gen}
     m = s.get("ollama") or []
     with _hist_lock:
         hist = {k: list(v) for k, v in _hist.items()}
+    # Ollama keeps no request log of its own; the last finished response (from
+    # its journal timings) is the one row the dashboard can honestly show.
+    reqs = [s["last_request"]] if s.get("last_request") and (s.get("engine") or {}).get("active") != "strata" else []
     return {"engine": {"model": synth_health(s)["model"], "max_context": (m[0].get("ctx") if m else 0) or 0},
-            "live": live, "requests": [], "requests_kept": 0, "totals": {}, "conversation_cache": None,
-            "hardware": hw, "history": hist, "time": time.time(),
+            "live": live, "requests": reqs, "requests_kept": len(reqs), "totals": {}, "conversation_cache": None,
+            "hardware": hardware(p, gen), "history": hist, "time": time.time(), "ts": s.get("ts"),
+            "stale": bool(s.get("stale")),
             "hardware_static": {"gpu_name": GPU_LABEL, "cpu_name": p.get("cpu_model"),
                                 "threads": p.get("ncpu"), "cores": (p.get("ncpu") or 0) // 2 or None,
                                 "psutil": True}}
@@ -1238,20 +1584,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _err(self, code, msg):
         self._send(code, {"error": {"message": msg, "type": "dashboard"}})
 
+    def _gate(self, method, path):
+        """_request_allowed for this request; sends the refusal and returns False when refused."""
+        bad = _request_allowed(method, path, self.headers, self.client_address[0])
+        if bad:
+            # The body (if any) is never read; close so it is not parsed as the next request.
+            self.close_connection = True
+            self._err(*bad)
+            return False
+        return True
+
     def _body(self):
+        """The request body. Only called after _gate, which vetted Content-Length."""
         n = int(self.headers.get("Content-Length") or 0)
-        return self.rfile.read(n) if n else b""
+        return self.rfile.read(n) if n > 0 else b""
 
     def _json_field(self, raw, key, default=""):
         try:
-            return json.loads(raw or b"{}").get(key, default)
+            d = json.loads(raw or b"{}")
         except ValueError:
             return default
+        return d.get(key, default) if isinstance(d, dict) else default
 
     def _hermes_events(self, r):
         """Relay the Hermes agent's SSE, turning its tool events into the page's tool blocks.
@@ -1329,6 +1688,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
             self.end_headers()
+            if self.command == "HEAD":
+                return
             try:
                 if hermes:
                     return self._hermes_events(r)
@@ -1342,8 +1703,10 @@ class Handler(BaseHTTPRequestHandler):
                 pass      # the page pressed Stop: dropping the upstream ends the run there too
 
     def _strata_metrics(self, url, s):
-        """Strata's /metrics with the GPU temperature swapped for the probe's hottest sensor,
-        so the page shows junction, not edge, whichever engine runs."""
+        """Strata's /metrics with the GPU temperature swapped for the probe's junction sensor,
+        so the page shows junction, not edge, whichever engine runs. The probe's own extras
+        (memory temp, fan, CPU temp, system draw, PCIe link) fill keys Strata leaves empty;
+        Strata reads its sensors through NVML, which an AMD card does not have."""
         req = urllib.request.Request(url)
         if STRATA_KEY:
             req.add_header("Authorization", "Bearer " + STRATA_KEY)
@@ -1354,17 +1717,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(e.code, e.read() or b"{}", e.headers.get("Content-Type") or "application/json")
         except Exception as e:
             return self._err(502, "upstream not reachable: %s" % str(e)[:120])
-        hot = (s.get("pc") or {}).get("temp")
+        if not isinstance(d, dict):
+            return self._send(200, d)
+        p = s.get("pc") or {}
+        hot = p.get("temp")
         hw = d.get("hardware") if isinstance(d.get("hardware"), dict) else None
-        if hot and hw is not None:
-            hw["gpu_temp"] = max(hot, hw.get("gpu_temp") or 0)
-            gpus = hw.get("gpus") or []
-            if len(gpus) == 1 and isinstance(gpus[0], dict):
-                gpus[0]["temp"] = hw["gpu_temp"]
+        if hw is not None and p:
+            for k, v in hardware(p).items():
+                if hw.get(k) is None and k != "tok_s":
+                    hw[k] = v
+            hw["gpu_mem_temp"] = p.get("temp_mem")
+            if hot is not None:
+                hw["gpu_temp"] = hot
+                gpus = hw.get("gpus") or []
+                if len(gpus) == 1 and isinstance(gpus[0], dict):
+                    gpus[0]["temp"] = hot
+        hist = d.get("history")
+        if hot is not None and isinstance(hist, dict) and isinstance(hist.get("gpu_temp"), list):
+            # Only swap whole series of the same length: the page draws every
+            # series against one time axis, and ours runs on its own clock.
+            n = len(hist["gpu_temp"])
             with _hist_lock:
-                mine = list(_hist["gpu_temp"])
-            if isinstance(d.get("history"), dict) and any(v for v in mine):
-                d["history"]["gpu_temp"] = mine
+                mine, mem = list(_hist["gpu_temp"]), list(_hist["gpu_mem_temp"])
+            if len(mine) == n and any(v is not None for v in mine):
+                hist["gpu_temp"] = mine
+                hist["gpu_mem_temp"] = mem
         return self._send(200, d)
 
     def _builder(self, method, path, query, raw):
@@ -1436,8 +1813,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(400, "bad JSON")
         if not isinstance(body, dict):
             return self._err(400, "Chat request must be a JSON object.")
-        for k in STRATA_ONLY_FIELDS:
-            if not strata_up(s):
+        up = strata_up(s)
+        if not up:
+            for k in STRATA_ONLY_FIELDS:
                 body.pop(k, None)
         stream = bool(body.get("stream"))
         e = s.get("engine") or {}
@@ -1452,7 +1830,9 @@ class Handler(BaseHTTPRequestHandler):
         if s.get("online") and e.get("active") == "ollama":
             selected = selected or body.get("model") or ollama_model(s)
             try:
-                available = installed_models(s)
+                available = installed_models(s, TAGS_MAX_AGE)
+                if selected not in [m["id"] for m in available["data"]]:
+                    available = installed_models(s)      # pulled a moment ago? ask once more, uncached
             except Exception:
                 return self._err(503, "Could not read installed Ollama models. Try again when Ollama is ready.")
             if selected not in [m["id"] for m in available["data"]]:
@@ -1478,7 +1858,7 @@ class Handler(BaseHTTPRequestHandler):
         if e.get("active") == "h3":
             return self._err(503, "The GPU is making a video (H3). Chat is back a few minutes after the last "
                                   "video, or choose an engine under Manage.")
-        if strata_up(s):
+        if up:
             body["model"] = e.get("model") or body.get("model") or "strata"
             if isinstance(body.get("messages"), list):
                 # With web tools the model kept reading shop pages that answer 403 until it hit
@@ -1521,6 +1901,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urllib.parse.urlsplit(self.path)
         path = u.path.lstrip("/")
+        if not self._gate("GET", path):
+            return
+        if path in ("api/stats", "metrics", "api/models"):
+            mark_view()           # somebody is watching: keep (or get) the poller at full speed
         if path == "api/stats":
             with _lock:
                 return self._send(200, json.dumps(_snapshot).encode())
@@ -1551,8 +1935,6 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("web/"):
             f = ui_file(path)
             return self._send(200, f[0], f[1]) if f else self._err(404, "not found")
-        if path.startswith(CONTROL_PATHS) and not _tailnet(self.client_address[0]):
-            return self._err(403, "Only from a Tailscale device.")
         if path == "api/voice":            # strata-voice (talk to the model); empty url = no voice button
             return self._send(200, json.dumps({"url": VOICE_URL}).encode())
         if path.startswith("api/builder/"):
@@ -1574,11 +1956,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, f[0], ctype) if f else self._err(404, "not found")
         self._err(404, "not found")
 
+    def do_HEAD(self):
+        """GET without the body (_send and the proxies check self.command)."""
+        self.do_GET()
+
     def do_PUT(self):
         path = urllib.parse.urlsplit(self.path).path.lstrip("/")
+        if not self._gate("PUT", path):
+            return
         raw = self._body()
-        if not _tailnet(self.client_address[0]):
-            return self._err(403, "Only from a Tailscale device.")
         if path.startswith("api/chats/"):
             try:
                 data = json.loads(raw or b"{}")
@@ -1590,8 +1976,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urllib.parse.urlsplit(self.path).path.lstrip("/")
-        if not _tailnet(self.client_address[0]):
-            return self._err(403, "Only from a Tailscale device.")
+        if not self._gate("DELETE", path):
+            return
         if path.startswith("api/chats/"):
             return self._send(200, {"ok": chat_delete(path[len("api/chats/"):])})
         if path.startswith("api/video/jobs/"):
@@ -1601,10 +1987,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urllib.parse.urlsplit(self.path)
         path = u.path.lstrip("/")
+        if not self._gate("POST", path):
+            return
         raw = self._body()
-        if path.startswith(CONTROL_PATHS) and not _tailnet(self.client_address[0]):
-            return self._err(403, "Chat and model settings only from a Tailscale device — "
-                                  "the agent behind them can run commands on the Mac.")
         if path == "v1/chat/completions":
             return self._chat(raw)
         if path.startswith("api/builder/"):
@@ -1613,6 +1998,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._video("POST", path, u.query, raw)
         if path in STRATA_PATHS or path.startswith("v1/"):
             return self._strata_path("POST", path, u.query, raw)
+        if path.startswith("api/"):
+            mark_view()           # a button was pressed: show its effect at full poll speed
         if path == "api/power":
             ok, msg = power_action(self._json_field(raw, "action"))
         elif path == "api/display":
@@ -1653,8 +2040,9 @@ def main():
     # then keep both loops running in the background.
     threading.Thread(target=state_syncer, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
-    # Bind loopback only — this exposes SSH-derived host stats and should not
-    # be reachable from the LAN or the tailnet.
+    # 0.0.0.0 by default: the page is meant to be opened from the LAN and the
+    # tailnet. Everything that changes something is fenced by _request_allowed
+    # (tailnet-only control paths, Host/Origin checks); -b 127.0.0.1 keeps it local.
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
     print("hermes-dashboard  →  http://localhost:%d" % args.port)
     if args.bind != "127.0.0.1":

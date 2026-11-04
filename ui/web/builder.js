@@ -132,7 +132,15 @@
     if (typeof scrollDown === "function") scrollDown(pinned);
   }
   function schedule(struct) { structural = structural || struct; liveMeta(ctx); if (!frame) frame = requestAnimationFrame(paint); }
-  setInterval(() => { if (follow && ctx.cur && ctx.phase) schedule(false); }, 1000);
+  // the running step's clock ("thinking · 12 s"): only that line changes, the answer is not drawn again
+  setInterval(() => {
+    if (!follow || !ctx.cur || !ctx.phase || document.hidden) return;
+    liveMeta(ctx);
+    const els = $("chat").querySelectorAll(".st-msg"), i = messages.length - 1;
+    const el = els.length === messages.length ? els[i] : null;
+    const line = el && messages[i] === ctx.cur ? el.querySelector(".meta-text") : null;
+    if (line) line.textContent = ctx.cur.meta || "";
+  }, 1000);
 
   // ------------------------------------------------------------------ following a session
   function stopFollowing() {
@@ -193,8 +201,10 @@
     }
     if (me.dead) return;
     if (me.ended) { follow = null; finish(); return; }
-    // the connection broke (phone locked, network change): pick it up again while the page is visible
+    // the connection broke (phone locked, network change): pick it up again while the page is visible; while it
+    // is hidden, let go (the run is still `working`), so coming back attaches again (visibilitychange below)
     if (!document.hidden) me.retry = setTimeout(() => { if (follow === me) attach(me.sid); }, 2500);
+    else if (follow === me) follow = null;
   }
   function finish() {
     working = false;

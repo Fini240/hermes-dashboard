@@ -5,12 +5,27 @@
 const $ = (id) => document.getElementById(id);
 const SPRITE = "web/sprite.svg";
 const icon = (name, cls = "st-icon") => `<svg class="${cls}" aria-hidden="true"><use href="${SPRITE}#i-${name}"/></svg>`;
-const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
-const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "–" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d}));
-const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000 ? 0 : 1)}k` : fmt(n));
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+// numbers in en-US style ("19.7", "1,234") everywhere, whatever the browser's locale: the page text is English
+const fmt = (n, d = 0) => (n == null || Number.isNaN(+n) ? "–" : Number(n).toLocaleString("en-US", {maximumFractionDigits: d, minimumFractionDigits: d}));
+// 950 -> "950", 12345 -> "12.3k", 63400042 -> "63.4M"
+const kfmt = (n) => {
+  if (n == null || Number.isNaN(+n)) return "–";
+  n = +n;
+  if (Math.abs(n) < 1000) return fmt(n);
+  const u = ["k", "M", "B", "T"];
+  let i = -1;
+  while (Math.abs(n) >= 1000 && i < u.length - 1) { n /= 1000; i++; }
+  return `${fmt(n, Math.abs(n) < 100 ? 1 : 0)}${u[i]}`;
+};
 // a context size: 32768 -> "32K" (powers of two), else like kfmt
 const ctxfmt = (n) => (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
 const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memory: binary GB, as Windows shows it
+// a metric's sub-line: pieces joined by " · ", each kept on one line so a narrow card wraps between them
+const subHtml = (parts) => (Array.isArray(parts) ? parts.filter((x) => x != null && x !== "")
+  .map((x) => `<span class="nw">${esc(x)}</span>`).join(" · ") : esc(parts || ""));
+// polls give up after a while, so a hung request cannot stall the loop
+const timeout = (ms) => (window.AbortSignal && AbortSignal.timeout ? AbortSignal.timeout(ms) : undefined);
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem("strata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
@@ -79,9 +94,10 @@ function showTab(name) {
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") focusInput();
   if (tab === "monitor") loadMcp();
-  if (tab === "about") loadConfig();
+  if (tab === "about") { aboutKey = ""; loadConfig(); }
   if (window.manageShown) window.manageShown(tab);
-  if (lastMetrics) render(lastMetrics);
+  render(lastMetrics);
+  if (fastTab() && !document.hidden && typeof poll === "function") poll();   // fresh numbers now, not in 5 s
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
 window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
@@ -100,14 +116,16 @@ $("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); 
 let health = {model: "strata", images: false, max_context: 0};
 async function loadHealth() {
   try {
-    health = await (await fetch("health")).json();
+    health = await (await fetch("health", {signal: timeout(8000)})).json();
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
   } catch (e) {
-    setTimeout(loadHealth, 2000);
+    clearTimeout(healthRetry);
+    healthRetry = setTimeout(loadHealth, 2000);
   }
 }
+let healthRetry = 0;
 
 // ------------------------------------------------------------------ Monitor
 const METRICS = [
@@ -136,64 +154,139 @@ $("metrics").innerHTML = METRICS.map((m) => `
         stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
   </div></div>`).join("");
 
-function spark(id, values, max) {
+// A sparkline. Nulls are gaps (the PC was off, a sensor did not answer): the path breaks there, and an all-null
+// series draws nothing. The scale runs from `min` to `max` (or the highest value, if higher).
+function spark(id, values, max, min = 0) {
   const svg = $(id);
-  const v = (values || []).map((x) => (x == null ? 0 : x));
-  if (v.length < 2) { svg.querySelector(".line").setAttribute("d", ""); svg.querySelector(".area").setAttribute("d", ""); return; }
-  const top = Math.max(max || 0, ...v, 1e-9);
-  const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 30 - (x / top) * 26]);
-  const line = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
-  svg.querySelector(".line").setAttribute("d", line);
-  svg.querySelector(".area").setAttribute("d", `${line}L100,32L0,32Z`);
+  if (!svg) return;
+  const v = values || [], line = svg.querySelector(".line"), area = svg.querySelector(".area");
+  const real = v.filter((x) => x != null && !Number.isNaN(+x)).map(Number);
+  if (v.length < 2 || !real.length) { line.setAttribute("d", ""); area.setAttribute("d", ""); return; }
+  const top = Math.max(max || 0, ...real, min + 1e-9), span = top - min;
+  const x = (i) => ((i / (v.length - 1)) * 100).toFixed(2);
+  const y = (n) => (30 - Math.max(0, Math.min(1, (n - min) / span)) * 26).toFixed(2);
+  let l = "", ar = "", run = [];
+  const flush = () => {
+    if (!run.length) return;
+    const pts = run.map(([i, n]) => `${x(i)},${y(n)}`);
+    l += `M${pts.join("L")}` + (run.length === 1 ? "l0.6,0" : "");
+    ar += `M${x(run[0][0])},32L${pts.join("L")}L${x(run[run.length - 1][0])},32Z`;
+    run = [];
+  };
+  v.forEach((n, i) => { if (n == null || Number.isNaN(+n)) flush(); else run.push([i, +n]); });
+  flush();
+  line.setAttribute("d", l);
+  area.setAttribute("d", ar);
 }
 function setMetric(key, value, unit, sub) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
-  $(`ms-${key}`).textContent = sub || "";
+  $(`ms-${key}`).innerHTML = subHtml(sub);
 }
 
-let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
+// ------------------------------------------------------------------ polling and the header pill
+// /metrics every second while the Monitor or About is open, every 5 s elsewhere, not at all while the page is
+// hidden. manage.js polls /api/stats (online, engine, power...) and hands each answer over through dash.setStats,
+// so the pill is decided here, from both, in one place.
+let lastMetrics = null, metricsFailures = 0, metricsErr = null, keyNeeded = false, keyWarned = false, mcpTick = 0;
+let stats = null, statsAt = 0;            // the latest /api/stats and when it arrived (ms)
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
+let pollTimer = 0, polling = false;
+const fastTab = () => tab === "monitor" || tab === "about";
 async function poll() {
+  if (polling) return;
+  polling = true;
+  clearTimeout(pollTimer);
   try {
-    const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
+    const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers(), signal: timeout(5000)});
     if (r.status === 401) {
-      setPill("error", "API key needed");
+      keyNeeded = true;
+      metricsErr = {status: 401, message: "API key needed"};
       if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
+      dropMetrics();
     } else if (r.ok) {
+      keyNeeded = false;
       lastMetrics = await r.json();
-      metricsFailures = 0;
+      metricsFailures = 0; metricsErr = null;
       render(lastMetrics);
+      window.dispatchEvent(new CustomEvent("dash:metrics", {detail: lastMetrics}));
     } else {
-      throw new Error(`HTTP ${r.status}`);
+      let message = `HTTP ${r.status}`;
+      try { message = (await r.json()).error.message || message; } catch (e) { /* not json */ }
+      throw Object.assign(new Error(message), {status: r.status});
     }
   } catch (e) {
-    if (++metricsFailures === 3) setPill("error", "Server not reachable");
+    metricsErr = {status: e.status || 0, message: e.message || String(e)};
+    metricsFailures++;
+    dropMetrics();
   }
+  polling = false;
   if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
-  setTimeout(poll, 1000);
+  if (!document.hidden) pollTimer = setTimeout(poll, fastTab() ? 1000 : 5000);
 }
+// no fresh numbers: every card goes back to "–" rather than showing the last ones as if they were current
+function dropMetrics() {
+  lastMetrics = null;
+  render(null);
+  window.dispatchEvent(new CustomEvent("dash:metrics", {detail: null}));
+}
+document.addEventListener("visibilitychange", () => {
+  clearTimeout(pollTimer);
+  if (!document.hidden) poll();
+});
 
-function setPill(state, text) {
-  $("pill").dataset.state = state === "error" ? "queued" : state;
+const asleepMsg = (e) => !!e && e.status === 503 && /asleep/i.test(e.message || "");
+// what the PC is doing, from /metrics and /api/stats: {state, text, label (for the Model state card)}
+function pcState() {
+  const live = (lastMetrics && lastMetrics.live) || {}, e = (stats && stats.engine) || {};
+  if (keyNeeded) return {state: "error", text: "API key needed"};
+  if ((stats && stats.ok !== false && stats.online === false) || asleepMsg(metricsErr) || live.state === "asleep")
+    return {state: "off", text: "Asleep", label: "__PC_NAME__ is asleep or off"};
+  // H3 holds the GPU: rendering, or kept a few minutes for quick follow-ups (chat waits either way)
+  if (live.state === "rendering" || e.active === "h3")
+    return {state: "queued", text: "Making a video", label: e.state === "rendering" || live.state === "rendering"
+      ? "The GPU is making a video" : "The video engine holds the GPU (chat waits until it gives it back)"};
+  if (live.state === "loading" || (e.active === "strata" && e.state === "loading"))
+    return {state: "queued", text: "Loading model", label: "Loading the model"};
+  if (!lastMetrics) {
+    if (!stats && metricsFailures < 3) return {state: "idle", text: "Connecting…", label: "Connecting"};
+    if (metricsFailures >= 3 || !stats) return {state: "error", text: "Server not reachable", label: "No data from the server"};
+  }
+  if (e.active === "strata" && e.state === "error") return {state: "error", text: "Model not answering", label: "The model is not answering"};
+  if (live.queued > 0) return {state: "queued", text: `${live.queued} queued`};
+  if (live.state === "reading") {
+    const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
+    return {state: "reading", text: pct != null ? `Reading prompt · ${pct}%` : "Reading prompt"};
+  }
+  if (live.state === "generating") return {state: "generating", text: `Generating · ${fmt(live.tok_s, 1)} tok/s`};
+  if (e.active === null || e.state === "none") return {state: "idle", text: "No engine", label: "No model engine runs"};
+  return {state: "idle", text: "Idle"};
+}
+// /api/stats older than 15 s (or the server says its poller failed): the numbers may not be current
+function statsStale() {
+  if (!stats) return false;
+  if (stats.stale) return true;
+  if (statsAt && Date.now() - statsAt > 15000) return true;
+  return stats.ts != null && Date.now() / 1000 - stats.ts > 15;
+}
+function updatePill() {
+  const p = pcState(), stale = statsStale();
+  const text = p.text + (stale && p.state !== "error" ? " · stale" : "");
+  $("pill").dataset.state = p.state;
   $("pill-text").textContent = text;
+  const why = stale ? (stats && stats.error ? `Data may be out of date: ${stats.error}` : "Data may be out of date") : "";
+  $("pill").title = why ? `${text} — ${why}` : text;
+  $("pill").setAttribute("aria-label", $("pill").title);
 }
 
 function render(m) {
+  updatePill();
+  const has = !!m;
+  m = m || {};
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || [])[0];
-  // the header pill
-  if (live.state === "reading") {
-    const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
-    setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
-  } else if (live.state === "generating") {
-    setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
-  } else {
-    setPill("idle", "Idle");
-  }
-  if (live.queued > 0) setPill("queued", `${live.queued} queued`);
-  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
-  if (tab === "monitor") renderConvCache(m.conversation_cache);
-  if (tab === "about") renderAbout(eng, hw, st);
+  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, has);
+  if (tab === "monitor") renderConvCache(has ? m.conversation_cache : null);
+  if (tab === "about" && has) renderAbout(eng, hw, st);
 }
 
 // #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
@@ -238,29 +331,37 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
-  // model state
-  const on = live.queued > 0 ? "queued" : live.state;
-  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
-  const prog = $("state-progress");
+let reqKey = "";          // the request table is rebuilt only when its rows change
+function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, has) {
+  // model state (asleep, a video, loading or no data light no badge: none of them is the model's own state)
+  const pc = pcState(), prog = $("state-progress");
+  const on = pc.label ? (pc.state === "error" ? "error" : "") : live.queued > 0 ? "queued" : live.state;
+  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", !!on && (b.dataset.s === on || (!pc.label && b.dataset.s === live.state)));
   let label = "Waiting for a request", detail = "", pct = 0;
-  if (live.state === "reading") {
+  if (pc.label) {                                  // asleep, making a video, loading, no data
+    label = pc.label;
+    delete prog.dataset.tone;
+    if (pc.state === "error") detail = metricsErr ? metricsErr.message : "";
+  } else if (live.state === "reading") {
     label = "Reading prompt";
     prog.dataset.tone = "info";
     if (live.prompt_total) {
       pct = (100 * live.prompt_read) / live.prompt_total;
       detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
-    } else {
+    } else if (live.prompt_tokens != null) {
       detail = `${fmt(live.prompt_tokens)} tokens`;
     }
   } else if (live.state === "generating") {
     label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
     delete prog.dataset.tone;
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+    detail = [live.generated != null ? `${fmt(live.generated)} tokens` : "", live.tok_s != null ? `${fmt(live.tok_s, 1)} tok/s` : ""]
+      .filter(Boolean).join(" · ");
   } else if (last) {
     delete prog.dataset.tone;
-    detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
+    const parts = [last.output_tokens != null ? `${fmt(last.output_tokens)} tokens` : "",
+                   last.decode_tok_s ? `${fmt(last.decode_tok_s, 1)} tok/s` : ""].filter(Boolean);
+    detail = parts.length ? `last: ${parts.join(" at ")}` : "";
   }
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
@@ -270,14 +371,14 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
   setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
             live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
-  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
+  const prefill = live.state === "reading" || live.state === "generating" ? live.prefill_tok_s_mean
                 : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
   setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
             live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
   spark("sp-speed", h.tok_s);
   spark("sp-prefill", h.prefill_tok_s_mean);
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
-  const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
+  const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`);
   const multi = (hw.gpus || []).length > 1;
   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
             multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || "");
@@ -286,20 +387,29 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
             multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
                   : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : "");
   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
+  // GPU temp is the junction (hottest) sensor; VRAM has its own
+  const crit = hw.gpu_temp_crit || 110;
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
-            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
-  spark("sp-temp", h.gpu_temp, 90);
+            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`))
+                  : hw.gpu_mem_temp != null ? `VRAM ${fmt(hw.gpu_mem_temp)} °C` : "");
+  spark("sp-temp", h.gpu_temp, crit, 30);
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
-  setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
-            hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
-            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
+  if (hw.gpu_pcie_rx_mb == null && hw.gpu_pcie_link) {
+    // no throughput counters (AMD): the negotiated link instead, "Gen3 x16 · 8 GT/s"
+    const [head, ...rest] = String(hw.gpu_pcie_link).split(" · ");
+    setMetric("pcie", head, "", rest.join(" · ") || "link");
+  } else {
+    setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
+              hw.gpu_pcie_rx_mb == null ? "" : [`to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s`,
+              hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? `idle Gen${hw.gpu_pcie_gen}` : ""]);
+  }
   spark("sp-pcie", h.gpu_pcie_rx_mb);
-  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
+  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? [st.cores ? `${st.cores} cores` : "", `${st.threads} threads`] : "");
   spark("sp-cpu", h.cpu, 100);
   if (hw.disk_read_mb == null) {
-    setMetric("disk", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
+    setMetric("disk", null, "", has && st.psutil === false ? "needs psutil (setup installs it)" : "");
   } else {
     const big = hw.disk_read_mb >= 1000;
     setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",
@@ -307,44 +417,53 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   }
   spark("sp-disk", h.disk_read_mb);
 
-  // context fill: the running request, else the last one
+  // context fill: the running request, else the last one; no model or no context size = no gauge
   const ctx = eng.max_context || 0;
-  let used = 0;
-  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-  const frac = ctx ? Math.min(1, used / ctx) : 0;
+  let used = null;
+  if (live.state === "reading" || live.state === "generating") used = (live.prompt_tokens || 0) + (live.generated || 0);
+  else if (last && last.prompt_tokens != null) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
+  const frac = ctx && used != null ? Math.min(1, used / ctx) : 0;
   $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
   $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
-  $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
-  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+  $("ctx-pct").textContent = ctx && used != null ? `${Math.round(frac * 100)}%` : "–";
+  $("ctx-sub").textContent = ctx ? `${used != null ? kfmt(used) : "–"} / ${ctxfmt(ctx)}` : "–";
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
   $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
   $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
-  $("ram-text").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` : "–";
-  const ramPct = hw.ram_total ? (100 * hw.ram_used) / hw.ram_total : 0;
+  $("ram-text").textContent = hw.ram_total && hw.ram_used != null ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` : "–";
+  const ramPct = hw.ram_total && hw.ram_used != null ? (100 * hw.ram_used) / hw.ram_total : 0;
   $("ram-bar").style.width = `${ramPct}%`;
   if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
-  $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
-  $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
+  // the temperature bar runs from 30 °C to the card's critical point (about 110 °C junction)
+  const t = hw.gpu_temp;
+  $("temp-text").textContent = t == null ? "–" : `${fmt(t)} °C${hw.gpu_mem_temp != null ? ` · VRAM ${fmt(hw.gpu_mem_temp)} °C` : ""}`;
+  $("temp-bar").style.width = t == null ? "0%" : `${Math.max(0, Math.min(100, (100 * (t - 30)) / (crit - 30)))}%`;
+  if (t != null && t >= 100) $("temp-progress").dataset.tone = "danger";
+  else if (t != null && t >= 85) $("temp-progress").dataset.tone = "warn";
+  else delete $("temp-progress").dataset.tone;
 
   // recent requests
-  const body = $("req-body");
-  if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="8" class="muted">No requests yet</td></tr>`;
-  } else {
-    const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
-                   disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
-    body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
-      const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
-      const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
-      const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
-      // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
-      const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
-        (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
-      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
-        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
-        <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
-    }).join("");
+  const key = JSON.stringify([has, requests.length, last ? [last.time, last.finish, last.output_tokens] : null, reqShowAll]);
+  if (key !== reqKey) {
+    reqKey = key;
+    const body = $("req-body");
+    if (!requests.length) {
+      body.innerHTML = `<tr><td colspan="8" class="muted">${has ? "No requests yet" : "–"}</td></tr>`;
+    } else {
+      const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
+                     disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
+      body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
+        const [cls, text] = badge[r.finish] || ["", r.finish || "Done"];
+        const t = r.time ? new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"}) : "–";
+        const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
+        // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
+        const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
+          (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
+        return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
+          <td class="num col-opt">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
+          <td class="num col-opt">${hit}</td><td class="num col-opt">${r.duration_s == null ? "–" : `${fmt(r.duration_s, 1)} s`}</td></tr>`;
+      }).join("");
+    }
   }
   const all = $("req-all");
   kept = kept == null ? requests.length : kept;
@@ -367,7 +486,11 @@ function projectionText(c) {
          `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}. Per chat in Sampling. Its package ` +
          "describes the vector as a refusal-direction projection; measure the speed yourself";
 }
+let aboutKey = "";        // About is rebuilt only when what it shows changes (or the tab opens)
 function renderAbout(eng, hw, st) {
+  const key = JSON.stringify([eng, hw.gpu_mem_total, hw.ram_total, st]);
+  if (key === aboutKey) return;
+  aboutKey = key;
   const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
   facts($("facts-engine"), [
     ["Model", eng.model],
@@ -403,7 +526,7 @@ $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (las
 let mcpInfo = {servers: [], tools: 0}, mcpRetry = null;
 async function loadMcp() {
   try {
-    const r = await fetch("mcp", {headers: headers()});
+    const r = await fetch("mcp", {headers: headers(), signal: timeout(8000)});
     if (!r.ok) return;
     mcpInfo = await r.json();
   } catch (e) { return; /* an older server: no MCP */ }
@@ -436,9 +559,12 @@ function renderMcp() {
 // A few documented keys of the run config (strata-<model>.json), for every client, from the next start on.  The
 // server lists them, checks every value and keeps every other key of the file as it is.
 let cfgKeys = [];
+// only Strata has a run config: with Ollama, H3 or a sleeping PC the request would just 404
+const strataUp = () => !!stats && stats.online !== false && stats.engine && stats.engine.active === "strata" && stats.engine.state !== "loading";
 async function loadConfig() {
+  if (!strataUp()) { $("cfg-card").hidden = true; return; }
   let r;
-  try { r = await fetch("config", {headers: headers()}); } catch (e) { return; }
+  try { r = await fetch("config", {headers: headers(), signal: timeout(8000)}); } catch (e) { return; }
   if (!r.ok) { $("cfg-card").hidden = true; return; }       // no run config, an older server, or no key yet
   const c = await r.json();
   cfgKeys = c.keys || [];
@@ -1085,6 +1211,24 @@ $("sampling-btn").onclick = () => openDrawer(true);
 $("drawer-close").onclick = () => openDrawer(false);
 $("scrim").onclick = () => openDrawer(false);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
+
+// ------------------------------------------------------------------ shared with the dashboard's own scripts
+// manage.js (loaded first, runs on DOMContentLoaded) formats with these and hands over each /api/stats answer.
+window.dash = {
+  fmt, kfmt, gb, esc, icon, subHtml, spark, timeout,
+  setStats(s) {
+    stats = s; statsAt = s ? Date.now() : statsAt;
+    updatePill();
+    if (tab === "monitor" && !lastMetrics) render(null);     // the Model state card follows the pill
+  },
+  stats: () => stats,
+  metrics: () => lastMetrics,
+};
+// the engine or its model changed (manage.js sees it first): the chat's model name, pictures and context follow
+window.addEventListener("dash:engine", () => {
+  loadHealth();
+  if (tab === "about") { aboutKey = ""; loadConfig(); }
+});
 
 // ------------------------------------------------------------------ start
 setBusy(false);

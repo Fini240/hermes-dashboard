@@ -4,10 +4,14 @@
 (() => {
   "use strict";
   const $ = (id) => document.getElementById(id);
-  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
-  const icon = (n, cls = "st-icon st-icon--sm") => `<svg class="${cls}" aria-hidden="true"><use href="web/sprite.svg#i-${n}"/></svg>`;
-  const num = (n) => { n = +n || 0; if (n < 1000) return String(Math.round(n)); const u = ["K", "M", "G", "T"]; let i = -1;
-    while (n >= 1000 && i < 3) { n /= 1000; i++; } return n.toFixed(1) + u[i]; };
+  // app.js' formatting (window.dash), so both halves of the page print numbers the same way. app.js loads after
+  // this file, but everything here that formats runs on DOMContentLoaded or later.
+  const D = () => window.dash;
+  const esc = (s) => D().esc(s);
+  const icon = (n, cls = "st-icon st-icon--sm") => D().icon(n, cls);
+  const num = (n) => D().kfmt(n);
+  const fmt = (n, d) => D().fmt(n, d);
+  const tmo = (ms) => (window.AbortSignal && AbortSignal.timeout ? AbortSignal.timeout(ms) : undefined);
   const dur = (s) => { s = Math.max(0, Math.round(s)); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
     return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`; };
   const store = { get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : v; } catch (e) { return d; } },
@@ -20,6 +24,8 @@
   let preferredModel = store.get("dash.chat-model", ""), selectedModel = "", modelEngine = "";
   let modelList = [], strataModels = [], modelsLoading = false, modelsError = "", modelRefreshAt = 0;
   let engineLoading = false, engineSwitching = false;
+  let modelsKey = "";       // the engine (active|model) the installed models were last asked for, success or not
+  let gpuNote = "";         // why there are no models right now ("GPU busy: making a video", asleep)
   const realFetch = window.fetch.bind(window);
   window.fetch = (url, opts) => {
     if (typeof url === "string" && url.replace(/^\//, "").startsWith("v1/chat/completions")) {
@@ -245,7 +251,7 @@
     if (modelsLoading) return;
     modelsLoading = true; modelRefreshAt = Date.now(); paintModels();
     try {
-      const r = await realFetch("/api/models", {cache: "no-store"});
+      const r = await realFetch("/api/models", {cache: "no-store", signal: tmo(10000)});
       const data = await r.json();
       if (!r.ok) throw new Error(data.error?.message || "Could not read installed models.");
       modelEngine = data.engine; modelList = data.data || []; modelsError = "";
@@ -256,8 +262,11 @@
       if (modelEngine === "ollama" && selectedModel) {
         preferredModel = selectedModel; store.set("dash.chat-model", selectedModel);
       }
-    } catch (e) { modelsError = e.message; selectedModel = ""; modelList = []; }
-    modelsLoading = false; paintModels(); paintTarget();
+    } catch (e) {
+      modelsError = e.name === "TimeoutError" ? "The PC did not answer in time." : e.message;
+      selectedModel = ""; modelList = [];
+    } finally { modelsLoading = false; }
+    paintModels(); paintTarget();
   }
   function paintModels() {
     const trigger = $("chat-model"); if (!trigger) return;
@@ -267,7 +276,7 @@
     const options = modelList.map((m) => option(m, modelEngine)).join("") + (modelEngine !== "strata" && strataModels.length
       ? `<div class="chat-model-menu__head">Strata · switches the GPU</div>` + strataModels.map((m) => option(m, "strata")).join("") : "");
     if ($("chat-model-list").innerHTML !== options) $("chat-model-list").innerHTML = options;
-    const name = selectedModel ? modelName(modelList.find((m) => m.id === selectedModel))
+    const name = gpuNote && !selectedModel ? gpuNote : selectedModel ? modelName(modelList.find((m) => m.id === selectedModel))
       : modelsLoading ? "Loading models…" : modelsError ? "Models unavailable" : "Choose model";
     trigger.querySelector("span").textContent = (target === "agent" ? "Hermes · " : target === "builder" ? "Builder · " : "") + (engineSwitching ? "Switching…" : name + (engineLoading ? " · loading…" : ""));
     trigger.disabled = working;
@@ -276,7 +285,7 @@
     if (trigger.disabled) toggleModels(false);
     $("chat-model-refresh").disabled = modelsLoading || working;
     $("chat-model-label").textContent = modelEngine === "strata" ? "Strata" : "Installed Ollama models";
-    $("chat-model-status").textContent = modelsError || (engineLoading ? "Loading the model — Send becomes available when it is ready." : modelEngine === "strata" ? "Switch to Ollama under Manage" : "");
+    $("chat-model-status").textContent = (gpuNote && !selectedModel ? (modelsError || gpuNote) : modelsError) || (engineLoading ? "Loading the model — Send becomes available when it is ready." : modelEngine === "strata" ? "Switch to Ollama under Manage" : "");
     const send = $("send-btn");
     if (send) send.disabled = working || engineLoading || (target === "builder" ? modelEngine !== "strata"
       : target !== "agent" && (modelsLoading || !!modelsError || !selectedModel));
@@ -325,10 +334,11 @@
   }
 
   // ---------------------------------------------------------------- actions
-  async function post(url, body, msgId) {
+  async function post(url, body, msgId, ms = 20000) {
     const m = $(msgId);
     try {
-      const r = await (await realFetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})).json();
+      const r = await (await realFetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
+                                             signal: tmo(ms)})).json();
       if (m) m.textContent = r.message;
       return r;
     } catch (e) { if (m) m.textContent = "Could not reach the dashboard server."; return {ok: false}; }
@@ -342,13 +352,14 @@
     if (engineSwitching || (typeof busy !== "undefined" && busy)) return;
     engineSwitching = true; engBusy = Date.now(); paintModels();
     for (const b of $("mg-eng").querySelectorAll("button")) b.disabled = true;
-    const result = await post("/api/engine", {engine, model}, "mg-eng-msg");
+    const result = await post("/api/engine", {engine, model}, "mg-eng-msg", 60000);
     try {
       if (!result.ok) throw new Error(result.message || "Could not switch the model.");
       for (let n = 0; n < 15; n++) {
-        const s = await (await realFetch("/api/stats", {cache: "no-store"})).json();
-        if (s.engine?.active === engine && (!model || s.engine.model === model)) {
-          paint(s); await loadModels(); return;
+        let s = null;
+        try { s = await (await realFetch("/api/stats", {cache: "no-store", signal: tmo(5000)})).json(); } catch (e) { /* try again */ }
+        if (s && s.engine?.active === engine && (!model || s.engine.model === model)) {
+          paint(s); modelsKey = engineKey(s); await loadModels(); return;
         }
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
@@ -386,22 +397,34 @@
   // ---------------------------------------------------------------- state
   const ENG = {loading: "loading…", idle: "ready", reading: "reading", generating: "generating", ready: "ready", error: "not answering"};
   let asleepToasted = false;
+  const engineKey = (s) => (s && s.engine ? `${s.engine.active}|${s.engine.model || ""}` : "");
+  let lastEngineKey = null;
   function paint(s) {
-    // asleep / awake
-    $("mg-asleep").hidden = !!s.online;
-    if (!s.online && !asleepToasted && typeof toast === "function") {
+    // asleep / awake. A server that is still starting answers ok:false with nothing probed yet: that is not
+    // "asleep", just no news.
+    const starting = s.ok === false && s.online == null;
+    const asleep = !starting && !s.online;
+    $("mg-asleep").hidden = !asleep;
+    if (asleep && !asleepToasted && typeof toast === "function") {
       asleepToasted = true;
       toast("warn", "__PC_NAME__ is asleep", "Wake it under Manage.", 6000);
     }
     if (s.online) asleepToasted = false;
-    const p = s.pc;
-    $("mg-pc-dot").className = "mg-dot " + (!s.online ? "off" : s.host_stats ? "on" : "warn");
-    $("mg-pc-text").textContent = !s.online ? "Asleep or off" : !s.host_stats ? "Online — no host metrics (SSH probe not answering)"
-      : `Online · up ${dur(p.uptime)} · ${p.total_watts != null ? Math.round(p.total_watts) + " W (est.)" : ""}`;
+    const p = s.pc || {};
+    $("mg-pc-dot").className = "mg-dot " + (starting ? "" : asleep ? "off" : s.host_stats ? "on" : "warn");
+    $("mg-pc-text").textContent = starting ? "Waiting for the first reading…" : asleep ? "Asleep or off"
+      : !s.host_stats ? "Online — no host metrics (SSH probe not answering)"
+      : ["Online", p.uptime != null ? `up ${dur(p.uptime)}` : "", p.total_watts != null ? `${Math.round(p.total_watts)} W (est.)` : ""]
+          .filter(Boolean).join(" · ");
     for (const b of document.querySelectorAll(".mg-btn")) if (!b.classList.contains("armed")) b.disabled = !s.host_stats;
 
-    // engine
+    // engine. A change (another engine, another Strata model) also reloads the chat's model info in app.js.
     const e = s.engine;
+    const ek = asleep ? "asleep" : engineKey(s);
+    if (lastEngineKey !== null && ek !== lastEngineKey) window.dispatchEvent(new CustomEvent("dash:engine", {detail: e || null}));
+    lastEngineKey = ek;
+    gpuNote = asleep ? "__PC_NAME__ is asleep" : e && e.active === "h3" ? "GPU busy: making a video"
+      : e && e.active == null && e.state === "none" ? "No engine: pick one under Manage" : "";
     engineLoading = e?.active === "strata" && (e.state === "loading" || e.state === "error");
     strataModels = s.strata_models || strataModels;
     if (!engBusy) for (const b of $("mg-eng").querySelectorAll("button")) {
@@ -452,8 +475,10 @@
       const kv = (k, v) => `<div class="mg-kv"><span>${esc(k)}</span><span class="v">${v}</span></div>`;
       const c = t.current;
       let h = `<div>${kv("Input", num(t.in))}${kv("Output", num(t.out))}${kv("Cached", num(t.cache_read))}` +
-              `${t.reasoning ? kv("Reasoning", num(t.reasoning)) : ""}${kv("API calls", t.calls.toLocaleString())}${kv("Sessions", t.sessions)}</div>`;
-      h += `<div>${c ? kv("Current session", `<code>${esc(c.id)}</code>`) + kv("Model", `<code>${esc(c.model)}</code>`) +
+              `${t.reasoning ? kv("Reasoning", num(t.reasoning)) : ""}${kv("API calls", fmt(t.calls))}${kv("Sessions", t.sessions)}</div>`;
+      const sid = String(c ? c.id : "");
+      const shortId = sid.length > 16 ? `${sid.slice(0, 10)}…${sid.slice(-4)}` : sid;
+      h += `<div>${c ? kv("Current session", `<code title="${esc(sid)}">${esc(shortId)}</code>`) + kv("Model", `<code>${esc(c.model)}</code>`) +
             kv("In / Out", `${num(c.in)} / ${num(c.out)}`) + kv("Last activity", `${dur(c.idle)} ago`) : ""}` +
            `${(t.models || []).slice(0, 4).map((x) => kv(x.name, `${num(x.out)} out · ${x.calls} calls`)).join("")}</div>`;
       $("mg-tok-body").innerHTML = h;
@@ -469,7 +494,11 @@
     cputemp: "CPU temp", ram: "RAM", power: "GPU power", fan: "GPU fan", disk: "Disk read", pcie: "PCIe"};
   const EXTRA = {
     sysw: {icon: "bolt", max: 750}, cputemp: {icon: "thermometer", max: 95, tone: "warn"},
-    ram: {icon: "memory", max: 100}, fan: {icon: "activity", max: 3500, tone: "info"}};
+    ram: {icon: "memory", max: 100}, fan: {icon: "activity", max: 3300, tone: "info"}};
+  // the server's history series for each extra card (/metrics history); the local buffer H only stands in
+  // for an older server that does not send them
+  const SERIES = {sysw: "total_watts", cputemp: "cpu_temp", ram: "ram_pct", fan: "gpu_fan"};
+  const MIN = {cputemp: 30};
   const SECTIONS = {state: ["Model state", ".state-card"], ctx: ["Context and memory", ".ctx-card"],
                     req: ["Recent requests", ".req-card"], cc: ["Conversation cache", "#cc-card"]};
   // PCIe stays empty on AMD cards (Strata reads it through NVML), so it starts hidden; GPU power is folded into
@@ -478,9 +507,18 @@
                           hidden: ["power", "fan", "disk", "pcie"], sections: {state: true, ctx: true, req: true, cc: true}};
   let layout;
   try { layout = JSON.parse(store.get("dash.monitor-layout", "null")); } catch (e) { layout = null; }
-  if (!layout || !Array.isArray(layout.order)) layout = JSON.parse(JSON.stringify(DEFAULT_LAYOUT));
-  for (const k of Object.keys(CARDS)) if (!layout.order.includes(k)) { layout.order.push(k); layout.hidden.push(k); }
-  layout.sections = Object.assign({}, DEFAULT_LAYOUT.sections, layout.sections || {});
+  // a saved layout from an older page (or a broken one): known cards only, each once; new cards are added hidden
+  function cleanLayout(l) {
+    const fresh = JSON.parse(JSON.stringify(DEFAULT_LAYOUT));
+    if (!l || typeof l !== "object" || !Array.isArray(l.order)) return fresh;
+    const order = [...new Set(l.order.filter((k) => k in CARDS))];
+    const hidden = [...new Set((Array.isArray(l.hidden) ? l.hidden : fresh.hidden).filter((k) => k in CARDS))];
+    for (const k of Object.keys(CARDS)) if (!order.includes(k)) { order.push(k); if (!hidden.includes(k)) hidden.push(k); }
+    const sections = Object.assign({}, fresh.sections);
+    if (l.sections && typeof l.sections === "object") for (const k of Object.keys(SECTIONS)) if (k in l.sections) sections[k] = !!l.sections[k];
+    return {order, hidden, sections};
+  }
+  layout = cleanLayout(layout);
   const saveLayout = () => store.set("dash.monitor-layout", JSON.stringify(layout));
   const H = {sysw: [], cputemp: [], ram: [], fan: []};
 
@@ -507,24 +545,45 @@
   function setVal(key, value, unit, sub) {
     const v = $(`mv-${key}`); if (!v) return;
     v.innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
-    $(`ms-${key}`).textContent = sub || "";
+    $(`ms-${key}`).innerHTML = D().subHtml(sub);
   }
-  function paintExtra(s) {
-    const p = s.pc;
-    if (!p) { for (const k of Object.keys(EXTRA)) setVal(k, null, "", ""); return; }
-    const push = (k, v) => { H[k].push(v == null ? 0 : v); if (H[k].length > 120) H[k].shift(); };
-    setVal("sysw", p.total_watts != null ? Math.round(p.total_watts) : null, "W",
-           p.cpu_watts != null ? `CPU ${Math.round(p.cpu_watts)} W · GPU ${Math.round(p.power)} W · est.` : "");
+  // The four extra cards. Values only the probe has (fan, CPU temperature, system draw) come from /api/stats; RAM
+  // and the GPU temperature come from the same /metrics answer app.js shows, so two cards never disagree.
+  let lastStats = null;
+  function paintExtra(fresh) {          // fresh: a new /api/stats answer (only those go into the local buffer)
+    const s = lastStats, m = D() ? D().metrics() : null;
+    const p = s && s.online ? s.pc : null;
+    if (!p) {                                       // asleep, starting or unreachable: nothing to show, nothing to keep
+      for (const k of Object.keys(EXTRA)) { setVal(k, null, "", ""); H[k] = []; spark(k, []); }
+      return;
+    }
+    const hw = (m && m.hardware) || {}, hist = (m && m.history) || {};
+    const push = (k, v) => { if (!fresh) return; H[k].push(v == null || Number.isNaN(+v) ? null : +v); if (H[k].length > 120) H[k].shift(); };
+    const W = (w) => (w == null ? null : `${fmt(w)} W`);
+    // an estimate (CPU package + GPU board + a fixed rest): "est." sits with the unit, not alone on a line
+    setVal("sysw", p.total_watts != null ? fmt(p.total_watts) : null, "W est.",
+           p.total_watts == null ? "" : [p.cpu_watts != null ? `CPU ${W(p.cpu_watts)}` : "", p.power != null ? `GPU ${W(p.power)}` : ""]);
     push("sysw", p.total_watts);
-    setVal("cputemp", p.cpu_temp ? Math.round(p.cpu_temp) : null, "°C", p.cpu_freq ? `${p.cpu_freq.toFixed(2)} GHz · load ${p.load.toFixed(2)}` : "");
+    const peak = p.cpu_freq_max, avg = p.cpu_freq;
+    setVal("cputemp", p.cpu_temp != null ? fmt(p.cpu_temp) : null, "°C", [
+      peak != null ? `${fmt(peak, 2)} GHz peak` : avg != null ? `${fmt(avg, 2)} GHz` : "",
+      peak != null && avg != null ? `${fmt(avg, 1)} avg` : "",
+      p.load != null ? `load ${fmt(p.load, 2)}` : ""]);
     push("cputemp", p.cpu_temp);
-    const rp = p.mem_total ? 100 * p.mem_used / p.mem_total : null;
-    setVal("ram", (p.mem_used / 1073741824).toFixed(1), `/ ${Math.round(p.mem_total / 1073741824)} GB`, rp != null ? `${Math.round(rp)}% used · up ${dur(p.uptime)}` : "");
+    const used = hw.ram_used != null ? hw.ram_used : p.mem_used, total = hw.ram_total || p.mem_total;
+    const rp = total && used != null ? 100 * used / total : null;
+    setVal("ram", used != null ? D().gb(used) : null, total ? `/ ${fmt(total / 1073741824)} GB` : "GB",
+           [rp != null ? `${fmt(rp)}% used` : "", p.uptime != null ? `up ${dur(p.uptime)}` : ""]);
     push("ram", rp);
-    setVal("fan", p.fan, "rpm", `GPU ${Math.round(p.temp)} °C`);
+    const junction = hw.gpu_temp != null ? hw.gpu_temp : p.temp;
+    setVal("fan", p.fan != null ? fmt(p.fan) : null, "rpm", junction != null ? `GPU ${fmt(junction)} °C` : "");
     push("fan", p.fan);
-    if (typeof spark === "function") for (const [k, x] of Object.entries(EXTRA)) spark(`sp-${k}`, H[k], x.max);
+    for (const [k, x] of Object.entries(EXTRA)) {
+      const server = hist[SERIES[k]];
+      spark(k, Array.isArray(server) ? server : H[k], x.max, MIN[k]);
+    }
   }
+  const spark = (k, values, max, min) => { if (D() && $(`sp-${k}`)) D().spark(`sp-${k}`, values, max, min || 0); };
   function buildLayoutCard() {
     $("manage").insertAdjacentHTML("beforeend", `<div class="st-card wide" id="mg-layout">
       <div class="mg-row" style="justify-content:space-between"><span class="card-title">Monitor layout</span>
@@ -621,20 +680,44 @@ body.dash-drag-active,body.dash-drag-active *{cursor:grabbing!important}
 .mg-item .st-btn--icon{width:30px;height:30px}</style>`);
 
   let tabNow = "chat";
-  window.manageShown = (t) => { tabNow = t; };
+  window.manageShown = (t) => { const was = tabNow; tabNow = t; if (t !== was && (t === "manage" || t === "monitor")) poll(); };
+  // /api/stats: every 2 s on Manage and the Monitor, every 5 s elsewhere, paused while the page is hidden
+  let pollTimer = 0, polling = false;
   async function poll() {
+    if (polling) return;
+    polling = true;
+    clearTimeout(pollTimer);
     try {
-      const s = await (await realFetch("/api/stats", {cache: "no-store"})).json();
+      const s = await (await realFetch("/api/stats", {cache: "no-store", signal: tmo(5000)})).json();
+      lastStats = s;
+      D().setStats(s);
       paint(s);
-      paintExtra(s);
-      if ((s.engine && (s.engine.active !== modelEngine || (s.engine.active === "strata" && s.engine.model !== selectedModel))) || Date.now() - modelRefreshAt > 30000) loadModels();
-    } catch (e) { /* dashboard server restarting */ }
-    setTimeout(poll, tabNow === "manage" || tabNow === "monitor" ? 2000 : 5000);
+      paintExtra(true);
+      // the installed models: again when the engine changes, else every 30 s - but never while H3 holds the GPU
+      // or the PC sleeps (it can only fail), and a failed engine is not asked again on every poll
+      const key = s.online ? engineKey(s) : "asleep";
+      if (gpuNote) {
+        if (selectedModel || modelList.length || modelsError) { selectedModel = ""; modelList = []; modelsError = ""; paintModels(); }
+        modelsKey = key;
+      } else if (key !== modelsKey || Date.now() - modelRefreshAt > 30000) {
+        modelsKey = key;
+        loadModels();
+      }
+    } catch (e) {
+      lastStats = null;           // dashboard server restarting or unreachable
+      D().setStats(null);
+      paintExtra();
+    }
+    polling = false;
+    if (!document.hidden) pollTimer = setTimeout(poll, tabNow === "manage" || tabNow === "monitor" ? 2000 : 5000);
   }
+  document.addEventListener("visibilitychange", () => { clearTimeout(pollTimer); if (!document.hidden) poll(); });
+  // app.js has new /metrics: the RAM and fan cards and the server's history follow it
+  window.addEventListener("dash:metrics", () => paintExtra());
   document.addEventListener("DOMContentLoaded", () => {
     build(); buildLayoutCard(); buildExtraCards(); applyLayout();
     sortable($("metrics"), ".metric-card", (it) => it.querySelector(".st-metric__value").id.slice(3), () => paintLayoutCard());
     sortable($("mg-cards"), ".mg-item", (it) => it.querySelector("input").dataset.k, () => {});
-    buildComposerSwitch(); paintTarget(); loadModels(); poll();
+    buildComposerSwitch(); paintTarget(); poll();
   });
 })();

@@ -28,6 +28,7 @@
 .vid-seg button:hover:not(:disabled){color:var(--st-ink)}
 .vid-seg button[aria-pressed="true"]{background:var(--st-surface);color:var(--st-ink);font-weight:700;box-shadow:var(--st-sh-card)}
 .vid-seg button:disabled{opacity:.4;cursor:not-allowed}
+.vid-seg button small{font-size:var(--st-fs-xs);font-weight:400;color:var(--st-ink-muted)}
 .vid-two{display:grid;grid-template-columns:1fr 1fr;gap:var(--st-s-3)}
 .vid-pic{display:flex;gap:12px;align-items:center}
 .vid-pic img{width:96px;height:64px;object-fit:cover;border-radius:10px;border:1px solid var(--st-line);background:var(--st-surface-2)}
@@ -60,6 +61,12 @@
   .vid{grid-template-columns:minmax(0,1fr);padding:var(--st-s-4) 16px}
   .vid-form{position:static}
   .vid-two{grid-template-columns:1fr}
+}
+/* phones: Size and Shape keep one row; each button puts its pixel size under its name */
+@media (max-width:520px){
+  #vid-size,#vid-paspect{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));flex-wrap:nowrap}
+  #vid-size button,#vid-paspect button{height:auto;min-height:42px;padding:6px 4px;line-height:1.2;white-space:normal}
+  #vid-size button small,#vid-paspect button small{display:block;margin-top:2px}
 }`;
   const st = document.createElement("style");
   st.textContent = css;
@@ -109,8 +116,8 @@
   }
 
   function seg(id, items, value, disabledFn) {
-    return `<div class="vid-seg" id="${id}" role="radiogroup">${items.map(([v, label]) =>
-      `<button type="button" role="radio" data-v="${esc(v)}" aria-pressed="${v === value}" aria-checked="${v === value}" ${disabledFn && disabledFn(v) ? "disabled" : ""}>${esc(label)}</button>`).join("")}</div>`;
+    return `<div class="vid-seg" id="${id}" role="radiogroup">${items.map(([v, label, sub]) =>
+      `<button type="button" role="radio" data-v="${esc(v)}" aria-pressed="${v === value}" aria-checked="${v === value}" ${disabledFn && disabledFn(v) ? "disabled" : ""}>${esc(label)}${sub ? ` <small>${esc(sub)}</small>` : ""}</button>`).join("")}</div>`;
   }
 
   // ---------------------------------------------------------------- render
@@ -129,7 +136,7 @@
         <textarea id="vid-prompt" maxlength="4000" placeholder="A cozy bakery window at dusk with a hand-painted sign that says &quot;FINN BAKES&quot;, warm light, photorealistic">${esc(keepPrompt)}</textarea></div>
       <div class="vid-field"><span class="vid-label">Model</span>${seg("vid-pmodel", models, form.pmodel)}
         <p class="muted small">${esc(note)}</p></div>
-      <div class="vid-field"><span class="vid-label">Shape</span>${seg("vid-paspect", P_ASPECTS.map(([k, l]) => [k, `${l} ${(pm.sizes[k] || []).join("×")}`]), form.paspect)}</div>
+      <div class="vid-field"><span class="vid-label">Shape</span>${seg("vid-paspect", P_ASPECTS.map(([k, l]) => [k, l, (pm.sizes[k] || []).join("×")]), form.paspect)}</div>
       <div class="vid-field" ${canEdit ? "" : "hidden"}>
         <span class="vid-label">Change a picture (optional)</span>
         <div class="vid-pic">${form.image ? `<img src="${form.image}" alt="">` : ""}
@@ -158,7 +165,7 @@
     if (!root) return;
     if (presets && form.kind === "picture") return renderPictureForm(root, $("vid-prompt")?.value ?? store.get("vid.prompt", ""));
     if (!presets) { root.innerHTML = `<span class="card-title">New video</span><p class="vid-empty">${esc(offline ? "The PC is asleep — wake it under Manage to make videos." : error || "Connecting to the video engine…")}</p>`; return; }
-    const sizes = Object.keys(presets.sizes).map((k) => { const [w, h] = dims(k, form.aspect); return [k, `${k[0].toUpperCase() + k.slice(1)} ${w}×${h}`]; });
+    const sizes = Object.keys(presets.sizes).map((k) => { const [w, h] = dims(k, form.aspect); return [k, k[0].toUpperCase() + k.slice(1), `${w}×${h}`]; });
     const lengths = lengthKeys().map((k) => [k, `${k} s`]);
     const quals = Object.entries(presets.quality).map(([k, v]) => [k, v.label.replace(/ \(.*/, "")]);
     const qnote = Object.entries(presets.quality).map(([k, v]) => `${v.label.replace(/ \(.*/, "")}: ${v.label.match(/\((.*)\)/)?.[1] || v.steps + " steps"}`).join(" · ");
@@ -212,7 +219,8 @@
     }
     const [w, h] = dims(form.size, form.aspect);
     const ahead = jobs.filter((j) => j.status === "queued" || j.status === "running").length;
-    el.textContent = `${w}×${h} · ${form.length} s · about ${mmss(estimate())}` + (ahead ? ` after the ${ahead} before it` : "");
+    el.textContent = `${w}×${h} · ${form.length} s · about ${mmss(estimate())}` +
+      (ahead === 1 ? ", once the job ahead of it is done" : ahead ? `, once the ${ahead} jobs ahead of it are done` : "");
   }
 
   function paintGpu() {
@@ -356,7 +364,8 @@
 
   async function api(method, path, body) {
     const r = await fetch("/api/video/" + path, {method, headers: body ? {"Content-Type": "application/json"} : {},
-                                                  body: body ? JSON.stringify(body) : undefined});
+                                                  body: body ? JSON.stringify(body) : undefined,
+                                                  signal: window.AbortSignal && AbortSignal.timeout ? AbortSignal.timeout(method === "GET" ? 10000 : 60000) : undefined});
     let data = null;
     try { data = await r.json(); } catch (e) { /* empty */ }
     if (!r.ok) throw Object.assign(new Error((data && (data.error?.message || data.error)) || `HTTP ${r.status}`), {status: r.status});
@@ -446,21 +455,26 @@
   }
 
   // ---------------------------------------------------------------- polling
+  let refreshSeq = 0;       // an older answer that arrives after a newer one is dropped
   async function refresh() {
     clearTimeout(timer);
+    const mine = ++refreshSeq;
     try {
       const d = await api("GET", "jobs");
+      if (mine !== refreshSeq) return;
       offline = false; error = "";
       const hadPresets = !!presets;
       presets = d.presets; health = d; jobs = d.jobs || [];
       fitLength();
       for (const j of jobs) {
-        if (seen[j.id] && seen[j.id] !== j.status && j.status === "done") say("success", "Video ready", j.prompt.slice(0, 80));
-        if (seen[j.id] && seen[j.id] !== j.status && j.status === "failed") say("error", "Video failed", j.error);
+        const what = j.kind === "picture" ? "Picture" : "Video";
+        if (seen[j.id] && seen[j.id] !== j.status && j.status === "done") say("success", `${what} ready`, (j.prompt || "").slice(0, 80));
+        if (seen[j.id] && seen[j.id] !== j.status && j.status === "failed") say("error", `${what} failed`, j.error);
         seen[j.id] = j.status;
       }
       if (!hadPresets && $("vid-form")) delete $("vid-form").dataset.ready;
     } catch (e) {
+      if (mine !== refreshSeq) return;
       offline = e.status === 503 && /asleep/.test(e.message);
       error = e.message;
       if (!presets && $("vid-form")) delete $("vid-form").dataset.ready;
@@ -469,6 +483,7 @@
     const active = jobs.some((j) => j.status === "queued" || j.status === "running");
     // fast while something renders; otherwise slow, and not at all while the tab is hidden and idle
     const next = active ? (shown ? 2000 : 8000) : (shown ? 15000 : 0);
+    clearTimeout(timer);
     if (next) timer = setTimeout(refresh, document.hidden ? Math.max(next, 15000) : next);
   }
 

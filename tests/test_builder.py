@@ -67,7 +67,8 @@ class BuilderProxyTests(unittest.TestCase):
 class IdentityNoteTests(unittest.TestCase):
     def test_note_replaces_old_copies(self):
         body = {"messages": [{"role": "system", "content": dashboard.RESEARCH_NOTE},
-                             {"role": "system", "content": "You are an old note"},
+                             # the dashboard's own note from an earlier turn (another model / day)
+                             {"role": "system", "content": dashboard.system_note("old-model", False, False)},
                              {"role": "user", "content": "hi"}]}
         dashboard.with_system(body, dashboard.system_note(dashboard.STRATA_LABEL, True, True))
         sys_msgs = [m for m in body["messages"] if m["role"] == "system"]

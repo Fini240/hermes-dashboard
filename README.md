@@ -37,8 +37,11 @@ browser ──GET /──────────► PAGE_HTML   (static, placeh
    poller thread (2s) ────────┤  ssh <PC> sysfs probe  → GPU/CPU/RAM/power
                               │  GET /api/ps           → resident models
                               └  read state.db         → token totals
-   syncer thread (15s) ─────────  ssh <mac> sqlite3 export → state.db
+   syncer thread (15s) ─────────  ssh <mac>: skip if unchanged, else .dump token table → state.db
 ```
+
+No page has asked for live data for 60 s: the poller drops to every 20 s and the syncer to
+60 s; the next page request wakes both at once.
 
 Two background threads own all slow I/O and write into `_snapshot`; HTTP handlers only
 serve the cached dict, so the page never waits on SSH.
@@ -88,7 +91,8 @@ instead of drifting across forked copies. See `.env.example` for the annotated l
 | `HERMES_WAKE_RELAY_URL` | LAN-side dashboard to relay wake through when away |
 | `HERMES_SSH_KEY` / `HERMES_KNOWN_HOSTS` | Key paths (no ssh-agent in a container) |
 | `HERMES_STATE_SYNC` | `user@host:/path/to/state.db`; blank disables token panels |
-| `HERMES_STATE_SYNC_SECONDS` | Token sync interval (default 15) |
+| `HERMES_STATE_SYNC_SECONDS` | Token sync interval (default 15; 60 s after a failure or with no page open) |
+| `HERMES_ALLOWED_HOSTS` | Extra host names (comma list) the page may be opened under. IP addresses, `localhost`, bare MagicDNS names and `*.ts.net` always work; any other `Host`/`Origin` is refused for writes and control paths (DNS-rebinding / CSRF guard) |
 | `HERMES_H3_URL` / `HERMES_H3_KEY` | h3-engine on the PC for the Video tab; blank = the tab says it is not configured |
 
 ## Studio: video (MiniMax H3) and pictures
