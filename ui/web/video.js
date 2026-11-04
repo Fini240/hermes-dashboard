@@ -34,6 +34,13 @@
 .vid-pic{display:flex;gap:12px;align-items:center}
 .vid-pic img{width:96px;height:64px;object-fit:cover;border-radius:10px;border:1px solid var(--st-line);background:var(--st-surface-2)}
 .vid-pic .st-btn{flex:none}
+.vid-refs{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.vid-ref{position:relative;width:84px;height:84px;flex:none}
+.vid-ref img{width:100%;height:100%;object-fit:cover;border-radius:10px;border:1px solid var(--st-line);background:var(--st-surface-2)}
+.vid-ref b{position:absolute;left:6px;top:6px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:rgba(0,0,0,.66);color:#fff;font-size:11px;line-height:20px;text-align:center}
+.vid-ref button{position:absolute;right:4px;top:4px;width:26px;height:26px;border-radius:13px;border:0;background:rgba(0,0,0,.66);color:#fff;display:grid;place-items:center;cursor:pointer;padding:0}
+.vid-ref button svg{width:14px;height:14px}
+.vid-refs .vid-add{height:84px}
 .vid details summary{cursor:pointer;font-size:var(--st-fs-sm);color:var(--st-ink-soft)}
 .vid details[open] summary{margin-bottom:var(--st-s-3)}
 .vid-go{display:flex;gap:var(--st-s-3);align-items:center;flex-wrap:wrap;position:sticky;bottom:calc(-1 * var(--st-s-5));z-index:1;
@@ -85,7 +92,7 @@
   const form = {
     mode: store.get("vid.mode", "text"), size: store.get("vid.size", "medium"), aspect: store.get("vid.aspect", "landscape"),
     length: store.get("vid.length", "2.3"), quality: store.get("vid.quality", "standard"), encoder: store.get("vid.encoder", "stock"),
-    seed: "", image: null, imageName: "",
+    seed: "", image: null, imageName: "", images: [],
     kind: store.get("vid.kind", "video"), pmodel: store.get("vid.pmodel", "flux3"), paspect: store.get("vid.paspect", "square"),
   };
   // 03.11.: Standard replaced Fast as the default (4 steps morph fine detail). Move a remembered "fast" once.
@@ -138,7 +145,16 @@
     const note = (pm.models[form.pmodel] || {}).label?.match(/\((.*)\)/)?.[1] || "";
     const canEdit = !!(pm.models[form.pmodel] || {}).edit;
     const editOnly = !!(pm.models[form.pmodel] || {}).edit_only;
-    if (!canEdit) form.image = null;
+    const maxRefs = pm.max_refs || 1;
+    const fibo = form.pmodel === "fibo";
+    const refHint = !canEdit
+      ? "This model can't use pictures. Adding one switches to FLUX 3 Klein."
+      : form.images.length > 1
+        ? (fibo ? "Name them in the prompt as <image_1>, <image_2> … (the numbers on the pictures)."
+                : "Name them in the prompt by number: “the man from picture 1 and the woman from picture 2 at a café in Rome”.")
+        : form.images.length === 1
+          ? "The prompt says what to change (“make it winter”) — or put the person into a new scene (“this man surfing a big wave”)."
+          : "Add photos of real people (a clear, well-lit face works best) or things, then describe the new picture. One picture alone = change that picture.";
     root.innerHTML = `
       <span class="card-title">New picture</span>
       <div class="vid-field">${seg("vid-kind", KINDS, form.kind)}</div>
@@ -147,13 +163,13 @@
       <div class="vid-field"><span class="vid-label">Model</span>${seg("vid-pmodel", models, form.pmodel)}
         <p class="muted small">${esc(note)}</p></div>
       <div class="vid-field"><span class="vid-label">Shape</span>${seg("vid-paspect", P_ASPECTS.map(([k, l]) => [k, l, (pm.sizes[k] || []).join("×")]), form.paspect)}</div>
-      <div class="vid-field" ${canEdit ? "" : "hidden"}>
-        <span class="vid-label">${editOnly ? "Picture to change" : "Change a picture (optional)"}</span>
-        <div class="vid-pic">${form.image ? `<img src="${form.image}" alt="">` : ""}
-          <button type="button" class="st-btn st-btn--secondary" id="vid-pick">${icon("image")}${form.image ? "Change" : "Choose a picture"}</button>
-          ${form.image ? `<button type="button" class="st-btn st-btn--icon" id="vid-unpick" title="Remove the picture" aria-label="Remove the picture">${icon("trash")}</button>` : ""}
-          <input type="file" id="vid-file" accept="image/png,image/jpeg,image/webp" hidden></div>
-        <p class="muted small">With a picture, the prompt says what to change (“make it winter”, “replace the sign text with …”).</p>
+      <div class="vid-field">
+        <span class="vid-label">${editOnly ? "Pictures to use" : "Reference pictures (optional)"} <small class="muted">${form.images.length}/${maxRefs}</small></span>
+        <div class="vid-refs">${form.images.map((src, i) => `<div class="vid-ref"><img src="${src}" alt="Picture ${i + 1}"><b>${i + 1}</b>
+            <button type="button" data-unref="${i}" title="Remove picture ${i + 1}" aria-label="Remove picture ${i + 1}">${icon("trash")}</button></div>`).join("")}
+          ${form.images.length < maxRefs ? `<button type="button" class="st-btn st-btn--secondary vid-add" id="vid-pick">${icon("image")}${form.images.length ? "Add" : "Add pictures"}</button>` : ""}
+          <input type="file" id="vid-file" accept="image/png,image/jpeg,image/webp" ${maxRefs > 1 ? "multiple" : ""} hidden></div>
+        <p class="muted small">${esc(refHint)}</p>
       </div>
       <details id="vid-adv" ${store.get("vid.adv", "") ? "open" : ""}><summary>More settings</summary>
         <div class="vid-field"><label class="vid-label" for="vid-seed">Seed</label>
@@ -228,7 +244,7 @@
     if (form.kind === "picture") {
       const m = (presets.pictures?.models || {})[form.pmodel] || {secs: 60};
       const [pw, ph] = presets.pictures?.sizes?.[form.paspect] || [1024, 1024];
-      el.textContent = `${pw}×${ph} · about ${mmss(m.secs * pw * ph / (1024 * 1024) + (form.image ? 20 : 0))}`;
+      el.textContent = `${pw}×${ph} · about ${mmss(m.secs * pw * ph / (1024 * 1024) + 20 * form.images.length)}`;
       return;
     }
     const [w, h] = dims(form.size, form.aspect);
@@ -268,7 +284,7 @@
       media = `<div class="vid-wait">${j.status === "running" ? `<div class="vid-bar"><i style="width:${Math.round((j.progress || 0) * 100)}%"></i></div>` : ""}<span>${msg}</span></div>`;
     }
     const meta = pic ? [`${j.width}×${j.height}`, ((presets?.pictures?.models || {})[j.model]?.label || j.model).replace(/ \(.*/, ""),
-      j.mode === "edit" ? "edited picture" : "", `seed ${j.seed}`, j.status === "done" && j.elapsed ? `made in ${mmss(j.elapsed)}` : "", ago(j.created)].filter(Boolean)
+      j.mode === "edit" ? ((j.refs || 1) > 1 ? `${j.refs} reference pictures` : "from your picture") : "", `seed ${j.seed}`, j.status === "done" && j.elapsed ? `made in ${mmss(j.elapsed)}` : "", ago(j.created)].filter(Boolean)
       : [`${j.width}×${j.height}`, `${j.seconds} s`, (presets?.quality?.[j.quality]?.label || j.quality).replace(/ \(.*/, ""),
       j.mode === "image" ? "from picture" : j.mode === "ref" ? "reference" : "", j.encoder === "uncensored" ? "uncensored" : "",
       `seed ${j.seed}`, j.status === "done" && j.elapsed ? `made in ${mmss(j.elapsed)}` : "", ago(j.created)].filter(Boolean);
@@ -365,9 +381,44 @@
     $("vid-go").onclick = submit;
     if ($("vid-pick")) {
       $("vid-pick").onclick = () => $("vid-file").click();
-      $("vid-file").onchange = (ev) => { const f = ev.target.files[0]; if (f) readImage(f); };
+      $("vid-file").onchange = (ev) => {
+        const files = [...ev.target.files];
+        if (!files.length) return;
+        if (form.kind === "picture") addRefs(files); else readImage(files[0]);
+      };
     }
     if ($("vid-unpick")) $("vid-unpick").onclick = () => { form.image = null; renderForm(); };
+    for (const b of document.querySelectorAll("#vid-form [data-unref]"))
+      b.onclick = () => { form.images.splice(+b.dataset.unref, 1); renderForm(); };
+  }
+  // Phone photos are 4000+ px and several MB: shrink to 1536 px JPEG in the browser, so four of them
+  // upload fast and stay far below the size limits. The engine would scale them to this size anyway.
+  async function shrink(f) {
+    const url = URL.createObjectURL(f);
+    try {
+      const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+      const k = Math.min(1, 1536 / Math.max(img.naturalWidth, img.naturalHeight));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      return c.toDataURL("image/jpeg", 0.92);
+    } finally { URL.revokeObjectURL(url); }
+  }
+  async function addRefs(files) {
+    const pm = presets?.pictures || {models: {}};
+    const max = pm.max_refs || 1;
+    if (!(pm.models[form.pmodel] || {}).edit) {           // Qwen-Image / Chroma can't take pictures
+      form.pmodel = "flux3"; store.set("vid.pmodel", "flux3");
+      say("info", "Switched to FLUX 3 Klein", "Qwen-Image and Chroma can't use reference pictures.");
+    }
+    const room = max - form.images.length;
+    if (files.length > room) say("warn", `Up to ${max} pictures`, room ? `Took the first ${room}.` : "Remove one first.");
+    for (const f of files.slice(0, Math.max(room, 0))) {
+      if (f.size > 30 * 1024 * 1024) { say("error", "Picture too large", `${f.name}: 30 MB at most.`); continue; }
+      try { form.images.push(await shrink(f)); }
+      catch (e) { say("error", "Could not read the picture", f.name + " — try a JPEG or PNG."); }
+    }
+    renderForm();
   }
   function readImage(f) {
     if (f.size > 15 * 1024 * 1024) return say("error", "Picture too large", "15 MB at most.");
@@ -390,14 +441,14 @@
     if (sending || !presets) return;
     const prompt = $("vid-prompt").value.trim();
     if (!prompt) { $("vid-prompt").focus(); return say("warn", "Write a prompt first"); }
-    if (form.kind === "picture" && (presets.pictures?.models?.[form.pmodel] || {}).edit_only && !form.image)
-      return say("warn", "Choose a picture", "Fibo 2.0 Edit changes an existing picture.");
+    if (form.kind === "picture" && (presets.pictures?.models?.[form.pmodel] || {}).edit_only && !form.images.length)
+      return say("warn", "Add a picture", "Fibo 2.0 Edit works from your pictures.");
     if (form.kind === "video" && form.mode !== "text" && !form.image) return say("warn", "Choose a picture", form.mode === "ref" ? "Reference mode needs one." : "Start-picture mode needs one.");
     sending = true; renderForm();
     try {
       const j = form.kind === "picture"
         ? await api("POST", "jobs", {kind: "picture", prompt, model: form.pmodel, aspect: form.paspect,
-                                     image: form.image || undefined, seed: form.seed ? +form.seed : undefined})
+                                     images: form.images.length ? form.images : undefined, seed: form.seed ? +form.seed : undefined})
         : await api("POST", "jobs", {prompt, mode: form.mode, image: form.mode === "text" ? undefined : form.image,
         size: form.size, aspect: form.aspect, length: form.length, quality: form.quality, encoder: form.encoder,
         seed: form.seed ? +form.seed : undefined});
@@ -418,10 +469,19 @@
     if (!j) return;
     if (b.dataset.act === "animate" || (b.dataset.act === "reuse" && j.kind === "picture")) {
       const animate = b.dataset.act === "animate";
-      try {
-        const blob = await (await fetch(`api/video/files/${encodeURIComponent(j.id)}/${animate ? "image.png" : "input.png"}`)).blob();
-        form.image = (animate || j.has_input) ? await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(blob); }) : null;
-      } catch (e) { form.image = null; }
+      const load = async (name) => {
+        const blob = await (await fetch(`api/video/files/${encodeURIComponent(j.id)}/${name}`)).blob();
+        return new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(blob); });
+      };
+      if (animate) {
+        try { form.image = await load("image.png"); } catch (e) { form.image = null; }
+      } else {
+        form.images = [];
+        const n = j.has_input ? (j.refs || 1) : 0;
+        for (let i = 0; i < n; i++) {
+          try { form.images.push(await load(i ? `ref-${i + 1}.png` : "input.png")); } catch (e) { /* job files gone */ }
+        }
+      }
       if (animate) {             // the picture becomes the first frame of a video
         Object.assign(form, {kind: "video", mode: "image", aspect: j.aspect === "portrait" ? "portrait" : j.aspect === "square" ? "square" : "landscape", seed: ""});
         store.set("vid.kind", "video"); store.set("vid.mode", "image"); store.set("vid.aspect", form.aspect);
